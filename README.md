@@ -47,7 +47,7 @@ Icarus is written in Rust, but all benchmarking scripts are written in Python an
 To deploy and benchmark a testbed of 4 nodes on your local machine, clone the repo and install the python dependencies:
 
 ```
-$ git clone [https://github.com/DGJGzy/icarus](https://github.com/DGJGzy/Icarus)
+$ git clone https://github.com/DGJGzy/Icarus
 $ cd icarus/benchmark
 $ pip install -r requirements.txt
 ```
@@ -120,13 +120,13 @@ ssh-keygen -f ~/.ssh/AWS
 
 **3. Configure the testbed**
 
-The file [settings.json](https://github.com/DGJGzy/icarus/blob/main/benchmark/settings.json) located in [Icarus/benchmark](https://github.com/CGCL-codes/Icarus/blob/main/benchmark) contains all the configuration parameters of the testbed to deploy.
+The file `settings.json` located in `Icarus/benchmark` contains all the configuration parameters of the testbed to deploy.
 
 **4. Create a testbed**
 
-The AWS instances are orchestrated with [Fabric](http://www.fabfile.org/) from the file [fabfile.py](https://github.com/CGCL-codes/icarus/blob/main/benchmark/fabfile.py) (located in [Icarus/benchmark](https://github.com/DGJGzy/icarus/blob/main/benchmark)) you can list all possible commands as follows:
+The AWS instances are orchestrated with [Fabric](http://www.fabfile.org/) from the file `fabfile.py` (located in `Icarus/benchmark`) you can list all possible commands as follows:
 
-The command `fab create` creates new AWS instances; open [fabfile.py](https://github.com/DGJGzy/icarus/blob/main/benchmark/fabfile.py) and locate the `create` task:
+The command `fab create` creates new AWS instances; open `fabfile.py` and locate the `create` task:
 
 ```python
 @task

@@ -13,10 +13,10 @@ def local(ctx):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'nodes': 4,
-        'rate': 100000,
-        'tx_size': 16,
+        'rate': 10000,
+        'tx_size': 256,
         'faults': 0,
-        'duration': 10,
+        'duration': 30,
     }
     node_params = {
         'consensus': {
@@ -36,7 +36,7 @@ def local(ctx):
         'mempool': {
             'queue_capacity': 10_000,
             'sync_retry_delay': 100_000,
-            'max_payload_size': 16_000,
+            'max_payload_size': 256_000,
             'min_block_delay': 0
         },
     }

@@ -47,12 +47,20 @@ Icarus is written in Rust, but all benchmarking scripts are written in Python an
 To deploy and benchmark a testbed of 4 nodes on your local machine, clone the repo and install the python dependencies:
 
 ```
-$ git clone https://github.com/DGJGzy/Icarus
-$ cd icarus/benchmark
+$ git clone https://github.com/CGCL-codes/Icarus
+$ cd Icarus/benchmark
 $ pip install -r requirements.txt
 ```
 
-You also need to install Clang (required by rocksdb) and [tmux](https://linuxize.com/post/getting-started-with-tmux/#installing-tmux) (which runs all nodes and clients in the background). Finally, run a local benchmark using fabric:
+You also need to install Clang (required by rocksdb) and [tmux](https://linuxize.com/post/getting-started-with-tmux/#installing-tmux) (which runs all nodes and clients in the background). 
+
+Then, compile the entire project:
+
+```
+$ cargo build
+```
+
+Finally, run a local benchmark using fabric:
 
 ```
 $ fab local
@@ -120,13 +128,13 @@ ssh-keygen -f ~/.ssh/AWS
 
 **3. Configure the testbed**
 
-The file `settings.json` located in `Icarus/benchmark` contains all the configuration parameters of the testbed to deploy.
+The file [settings.json](https://github.com/CGCL-codes/icarus/blob/main/benchmark/settings.json) located in [Icarus/benchmark](https://github.com/CGCL-codes/Icarus/blob/main/benchmark) contains all the configuration parameters of the testbed to deploy.
 
 **4. Create a testbed**
 
-The AWS instances are orchestrated with [Fabric](http://www.fabfile.org/) from the file `fabfile.py` (located in `Icarus/benchmark`) you can list all possible commands as follows:
+The AWS instances are orchestrated with [Fabric](http://www.fabfile.org/) from the file [fabfile.py](https://github.com/CGCL-codes/icarus/blob/main/benchmark/fabfile.py) (located in [Icarus/benchmark](https://github.com/CGCL-codes/icarus/blob/main/benchmark)) you can list all possible commands as follows:
 
-The command `fab create` creates new AWS instances; open `fabfile.py` and locate the `create` task:
+The command `fab create` creates new AWS instances; open [fabfile.py](https://github.com/CGCL-codes/icarus/blob/main/benchmark/fabfile.py) and locate the `create` task:
 
 ```python
 @task
@@ -150,7 +158,7 @@ You can then clone the repo and install rust on the remote instances with `fab i
 $ fab install
 
 Installing rust and cloning the repo...
-Initialized testbed of 10 nodes
+Initialized testbed of 8 nodes
 ```
 
 **5. Run a benchmark**
@@ -222,5 +230,4 @@ This software is licensed as [Apache 2.0](./LICENSE).
 - [Speeding Dumbo](https://eprint.iacr.org/2022/027)
 - [Tusk](https://dl.acm.org/doi/10.1145/3492321.3519594)
 - [Fin](https://dl.acm.org/doi/10.1145/3576915.3616633)
-
 

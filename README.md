@@ -47,7 +47,7 @@ Icarus is written in Rust, but all benchmarking scripts are written in Python an
 To deploy and benchmark a testbed of 4 nodes on your local machine, clone the repo and install the python dependencies:
 
 ```
-$ git clone https://github.com/CGCL-codes/Icarus
+$ git clone https://github.com/DGJGzy/Icarus
 $ cd Icarus/benchmark
 $ pip install -r requirements.txt
 ```

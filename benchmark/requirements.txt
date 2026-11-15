@@ -1,3 +1,4 @@
-boto3==1.16.0
+alibabacloud_ecs20140526==4.1.8
+alibabacloud_vpc20160428==6.6.6
 fabric==2.6.0
-matplotlib==3.3.4
+matplotlib==3.10.9

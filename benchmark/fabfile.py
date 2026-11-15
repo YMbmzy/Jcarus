@@ -2,10 +2,10 @@ from fabric import task
 
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
-from benchmark.utils import Print
+from benchmark.utils import BenchError, Print
 from benchmark.plot import Ploter, PlotError
-from aws.instance import InstanceManager
-from aws.remote import Bench, BenchError
+from alibaba.instance import InstanceManager
+from alibaba.remote import Bench
 
 
 @task
@@ -48,8 +48,8 @@ def local(ctx):
 
 
 @task
-def create(ctx, nodes=2): # 创建机器实例  nodes表示在一台机器上跑多少个节点
-    ''' Create a testbed'''
+def create(ctx, nodes=1): # 每个地域创建 nodes 台机器，每台机器运行一个节点
+    ''' Create `nodes` Alibaba Cloud instances per region '''
     try:
         InstanceManager.make().create_instances(nodes)
     except BenchError as e:
@@ -103,10 +103,10 @@ def install(ctx):
 
 @task
 def remote(ctx):
-    ''' Run benchmarks on AWS '''
+    ''' Run benchmarks on Alibaba Cloud '''
     bench_params = {
-        'nodes': [7],
-        'rate': [100000],
+        'nodes': [4],
+        'rate': [4000],
         'tx_size': 256,
         'faults': 0, 
         'duration': 100,

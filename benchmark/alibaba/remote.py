@@ -1,12 +1,11 @@
-from os import error
 from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
-from paramiko import RSAKey
-from paramiko.ssh_exception import PasswordRequiredException, SSHException
 from os.path import basename, splitext
 from time import sleep
 from math import ceil
-from os.path import join
+from itertools import zip_longest
+from os.path import isfile, join
+from shlex import quote
 from datetime import datetime
 import subprocess
 
@@ -14,7 +13,7 @@ from benchmark.config import Committee, Key, TSSKey, NodeParameters, BenchParame
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
-from aws.instance import InstanceManager
+from alibaba.instance import InstanceManager
 
 class FabricError(Exception):
     ''' Wrapper for Fabric exception with a meaningfull error message. '''
@@ -33,13 +32,10 @@ class Bench:
     def __init__(self, ctx):
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
-        try:
-            ctx.connect_kwargs.pkey = RSAKey.from_private_key_file(
-                self.manager.settings.key_path
-            )
-            self.connect = ctx.connect_kwargs
-        except (IOError, PasswordRequiredException, SSHException) as e:
-            raise BenchError('Failed to load SSH key', e)
+        if not isfile(self.settings.key_path):
+            raise BenchError('Failed to load SSH key', FileNotFoundError(self.settings.key_path))
+        self.connect = dict(ctx.connect_kwargs)
+        self.connect['key_filename'] = self.settings.key_path
 
     def _check_stderr(self, output):
         if isinstance(output, dict):
@@ -52,29 +48,31 @@ class Bench:
 
     def install(self):
         Print.info('Installing rust and cloning the repo...')
+        repo = quote(join('.', self.settings.repo_name))
+        branch = quote(self.settings.branch)
+        url = quote(self.settings.repo_url)
         cmd = [
-            'sudo apt-get update',
-            'sudo apt-get -y upgrade',
-            'sudo apt-get -y autoremove',
+            'if [ "$(id -u)" -eq 0 ]; then SUDO=; else SUDO=sudo; fi',
+            'if command -v cloud-init >/dev/null 2>&1; then $SUDO cloud-init status --wait; fi',
+            '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update',
+            '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 '
+            'install -y tmux git curl ca-certificates build-essential cmake clang pkg-config libssl-dev',
 
-            # The following dependencies prevent the error: [error: linker `cc` not found].
-            'sudo apt-get -y install build-essential',
-            'sudo apt-get -y install cmake',
-
-            # Install rust (non-interactive).
+            # Install rust (non-interactive) for the configured SSH user.
             'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
-            'source $HOME/.cargo/env',
+            '. "$HOME/.cargo/env"',
             'rustup default stable',
 
-            # This is missing from the Rocksdb installer (needed for Rocksdb).
-            'sudo apt-get install -y clang',
-
-            # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
+            # Clone or update the configured branch in the configured directory.
+            f'if [ -d {repo}/.git ]; then '
+            f'git -C {repo} fetch -f origin && '
+            f'git -C {repo} checkout -f {branch} && '
+            f'git -C {repo} pull --ff-only origin {branch}; '
+            f'else git clone --branch {branch} -- {url} {repo}; fi'
         ]
         hosts = self.manager.hosts(flat=True)
         try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+            g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=False)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
         except (GroupException, ExecutionError) as e:
@@ -88,7 +86,7 @@ class Bench:
         # delete_logs = CommandMaker.clean_logs() if delete_logs else 'true'
         cmd = f'({CommandMaker.kill()} || true)'
         try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+            g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
             g.run(cmd, hide=True)
         except GroupException as e:
             raise BenchError('Failed to kill nodes', FabricError(e))
@@ -102,14 +100,18 @@ class Bench:
             return []
 
         # Select the hosts in different data centers.
-        ordered = zip(*hosts.values())
-        ordered = [x for y in ordered for x in y]
+        ordered = [
+            host for row in zip_longest(*hosts.values())
+            for host in row if host is not None
+        ]
         return ordered[:nodes]
 
     def _background_run(self, host, command, log_file):
         name = splitext(basename(log_file))[0]
-        cmd = f'tmux new -d -s "{name}" "{command} |& tee {log_file}"'
-        c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+        pipeline = f'{command} 2>&1 | tee {quote(log_file)}'
+        shell_command = f'sh -c {quote(pipeline)}'
+        cmd = f'tmux new -d -s {quote(name)} {quote(shell_command)}'
+        c = Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
 
@@ -117,17 +119,19 @@ class Bench:
         Print.info(
             f'Updating {len(hosts)} nodes (branch "{self.settings.branch}")...'
         )
+        repo = quote(join('.', self.settings.repo_name))
+        branch = quote(self.settings.branch)
         cmd = [
-            f'(cd {self.settings.repo_name} && git fetch -f)',
-            f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
-            f'(cd {self.settings.repo_name} && git pull -f)',
-            'source $HOME/.cargo/env',
-            f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
-            CommandMaker.alias_binaries(
-                f'./{self.settings.repo_name}/target/release/'
-            )
+            f'git -C {repo} fetch -f origin',
+            f'git -C {repo} checkout -f {branch}',
+            f'git -C {repo} pull --ff-only origin {branch}',
+            '. "$HOME/.cargo/env"',
+            f'(cd {quote(join(self.settings.repo_name, "node"))} && {CommandMaker.compile()})',
+            '(' + CommandMaker.alias_binaries(
+                quote(join('.', self.settings.repo_name, 'target', 'release'))
+            ) + ')'
         ]
-        g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+        g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
         g.run(' && '.join(cmd), hide=True)
 
     def _config(self, hosts, node_parameters):
@@ -177,13 +181,13 @@ class Bench:
 
         # Cleanup all nodes.
         cmd = f'{CommandMaker.cleanup()} || true'
-        g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+        g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
         g.run(cmd, hide=True)
 
         # Upload configuration files.
         progress = progress_bar(hosts, prefix='Uploading config files:')
         for i, host in enumerate(progress):
-            c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+            c = Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
             c.put(PathMaker.committee_file(), '.')
             c.put(PathMaker.key_file(i), '.')
             c.put(PathMaker.threshold_key_file(i), '.')
@@ -202,7 +206,7 @@ class Bench:
 
         # Make dir
         cmd = f'{CommandMaker.make_logs_and_result_dir(ts)}'
-        g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+        g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
         g.run(cmd, hide=True)
         
         # Run the clients (they will wait for the nodes to be ready).
@@ -257,7 +261,7 @@ class Bench:
         # Download log files.
         progress = progress_bar(hosts, prefix='Downloading logs:')
         for i, host in enumerate(progress):
-            c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+            c = Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
             c.get(PathMaker.node_log_file(i, ts), local=PathMaker.node_log_file(i, ts))
             c.get(
                 PathMaker.client_log_file(i, ts), local=PathMaker.client_log_file(i, ts)
@@ -294,16 +298,16 @@ class Bench:
         Print.info(f'Timeout {node_parameters.timeout_delay} ms, Network delay {node_parameters.network_delay} ms')
         Print.info(f'DDOS attack {node_parameters.ddos}')
 
-        hosts = selected_hosts[:bench_parameters.nodes[0]]
-        # Upload all configuration files.
-        try:
-            self._config(hosts, node_parameters)
-        except (subprocess.SubprocessError, GroupException) as e:
-            e = FabricError(e) if isinstance(e, GroupException) else e
-            Print.error(BenchError('Failed to configure nodes', e))
-        
         # Run benchmarks.
         for n in bench_parameters.nodes:
+            # Configure the full committee before omitting faulty nodes.
+            hosts = selected_hosts[:n]
+            try:
+                self._config(hosts, node_parameters)
+            except (OSError, subprocess.SubprocessError, GroupException, ConfigError) as e:
+                e = FabricError(e) if isinstance(e, GroupException) else e
+                raise BenchError('Failed to configure nodes', e)
+
             for r in bench_parameters.rate:
                 Print.heading(f'\nRunning {n} nodes (input rate: {r:,} tx/s)')
                 hosts = selected_hosts[:n]

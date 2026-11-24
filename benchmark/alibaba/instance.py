@@ -418,12 +418,25 @@ class InstanceManager:
         for region, ids in targets.items():
             self._wait_instances(region, ids)
             groups = self._security_groups(region)
-            for group in groups:
-                self._call(region, 'delete_security_group', ecs.DeleteSecurityGroupRequest(
-                    region_id=region, security_group_id=group['SecurityGroupId'],
-                ))
-            pending = {group['SecurityGroupId'] for group in groups}
             deadline = monotonic() + self.WAIT_TIMEOUT
+            for group in groups:
+                while True:
+                    try:
+                        self._call(region, 'delete_security_group', ecs.DeleteSecurityGroupRequest(
+                            region_id=region, security_group_id=group['SecurityGroupId'],
+                        ))
+                        break
+                    except BenchError as error:
+                        if getattr(error.cause, 'code', None) != 'DependencyViolation':
+                            raise
+                        # Instance queries can clear before security-group detachment completes.
+                        if monotonic() >= deadline:
+                            raise BenchError(
+                                f'Timed out deleting security group {group["SecurityGroupId"]} in {region}',
+                                TimeoutError(str(error.cause)),
+                            ) from error
+                        sleep(self.POLL_INTERVAL)
+            pending = {group['SecurityGroupId'] for group in groups}
             while pending:
                 pending.intersection_update(group['SecurityGroupId'] for group in self._security_groups(region))
                 if not pending:

@@ -277,7 +277,7 @@ authentication separately; AccessKeys do not grant Git access.
 Linux binaries are built on ECS; macOS binaries are not uploaded to Linux.
 
 Configure experiment size/rate/duration/faults in the `remote` task in
-`fabfile.py`. Its current default needs at least seven running, publicly
+`fabfile.py`. Its current default needs at least four running, publicly
 addressable machines. Regions are selected round-robin; each node-count setting
 gets its own committee. Logs/results remain in `logs/<timestamp>/` and
 `results/<timestamp>/`.
@@ -296,6 +296,122 @@ regions. VPCs and vSwitches, including automatically created ones, are retained
 for reuse and must be deleted manually when no longer needed. Unrelated resources
 and independently retained disks/snapshots are not deleted. Do not change the
 testbed name or remove regions before cleaning up the old testbed.
+
+### Independent collector/controller
+
+Run the existing benchmark from an independent ECS machine, keeping raw logs
+and parsing in the cloud. Only result files are downloaded to the local machine.
+The collector defaults to Hong Kong (`cn-hongkong`), outside the four experiment
+regions, with `ecs.g9i.xlarge`, Ubuntu 22.04, a 200 GiB ESSD system disk, and
+100 Mbit/s public egress. Availability is checked at creation; there is no
+automatic region/type substitution.
+
+Configure the `collector` section in `benchmark/settings.json`. Its `name`
+identifies exactly one collector; `region` must not appear in `instances.regions`.
+The separate `JcarusCollector=<collector.name>` tag and SSH-only security group
+exclude it from the normal consensus-node `create/start/stop/destroy` commands.
+Resources carrying both collector and consensus tags are never adopted.
+Keep the experiment regions and `instances.name` unchanged.
+
+`collector.ssh_cidr` defaults to `0.0.0.0/0`, exposing only SSH. Restrict it to
+your local public IP/CIDR before creation when possible. Existing security-group
+rules are not automatically revoked. Allow outbound API/package/Git access and
+SSH from the collector to the experiment nodes; no consensus ports are needed
+on the collector itself.
+
+Run these commands locally from `benchmark/`, with the project's Python 3.10
+environment activated and system `ssh`, `ssh-keygen`, and `rsync` available:
+
+```shell
+fab collector-create
+fab collector-info
+fab collector-setup
+fab collector-ssh
+```
+
+`collector-create` reuses the unique matching instance, starting it if stopped;
+it does not create a second instance. Creation and starting incur charges.
+Before creating a new instance it derives the public key from `key.path`,
+checks the same `key.name` in the collector region, and imports it if absent.
+A different/unverifiable existing public key is an error, not overwritten.
+Local cloud credentials therefore also need Hong Kong access and ECS
+`DescribeKeyPairs`/`ImportKeyPair` permissions, in addition to the cloud
+management/network permissions above. Creation stock checks are not reservations.
+
+`collector-setup` shares the normal `fab install` implementation, deploys the
+configured Jcarus repository at `~/Jcarus`, and installs Python 3.10, rsync, and
+`~/Jcarus/.venv` with `benchmark/requirements.txt`. Current local benchmark
+Python scripts are uploaded too, so new commands do not require a Git push.
+Rust sources on experiment nodes still come from `repo.url`/`repo.branch`.
+The sample repository configuration points to `YMbmzy/Jcarus`.
+
+Setup copies exactly the configured `key.path` and `key.accesskey` files over
+SSH/SFTP to the remote user's `~/.ssh/Aliyun/id_ed25519` and
+`~/.aliyun/access.json`. It requires both files; environment-only AccessKeys are
+not sufficient for this command. Private directories use mode 700, and atomic
+credential uploads use mode 600. The remote settings retain `key.name`, the
+four experiment regions and testbed name, with rewritten credential paths.
+Repeat setup redeploys local benchmark scripts/settings but preserves results.
+The collector now holds the same credentials and effective cloud permissions
+as the local machine; RAM source-IP restrictions still apply. Never use an
+untrusted collector or put these files in Git.
+
+Confirm the collector SSH host fingerprint on first access; changed keys are
+not silently accepted. Setup verifies `DescribeInstances` in every experiment
+region and SSH to discovered running nodes. If none are running it explicitly
+reports that node SSH was not verified. Node host keys use trust-on-first-use
+and reject subsequent changes. Encrypted SSH keys require an available unlocked
+key on the collector for non-interactive node access.
+
+`collector-ssh` enters `~/Jcarus/benchmark` with the virtualenv and Rust
+environment loaded. Run experiments inside tmux so SSH disconnection does not
+interrupt the controller:
+
+```shell
+tmux new -s jcarus
+cd ~/Jcarus/benchmark
+. ../.venv/bin/activate
+. "$HOME/.cargo/env"
+fab info
+fab install
+fab remote
+```
+
+Back on the local machine, choose either download mode:
+
+| Command | Local destination and behavior |
+|---|---|
+| `fab collector-download` | New UTC timestamp/random directory under `benchmark/collector-results/downloads/` on every invocation; previous downloads are never overwritten. Failed snapshots are removed. |
+| `fab collector-sync` | `benchmark/collector-results/current/`; checksum-different remote files overwrite local files, identical files are skipped, local-only files are retained. |
+| `fab collector-download --directory=/path/to/archive` | Create a unique child under the supplied archive root. |
+| `fab collector-sync --directory=/path/to/current` | Incrementally update the supplied directory itself. |
+
+Both modes pull only `~/Jcarus/benchmark/results/`, never upload local results,
+never propagate deletion, and reject destinations overlapping the original local
+`benchmark/results/` or credential directories. Default local paths are anchored
+beside settings.json and ignored by Git. Interrupted incremental downloads may
+leave already transferred files; rerunning transfers remaining differences.
+Downloads during an experiment capture only currently written data; download
+after it finishes for complete results. The remote sender helper is deployed
+by setup and also supports macOS's system rsync.
+
+```shell
+fab collector-destroy
+```
+
+Destruction requires typing the displayed collector instance ID (or collector
+name when only orphan security groups remain). Download results first: remote
+logs/results/credentials may be lost. Only collector-tagged instances and
+security groups are removed; consensus resources and local downloads are kept.
+VPCs/vSwitches and independently retained disks/snapshots remain; inspect the
+console for retained resources and billing. Normal `fab destroy` intentionally
+does not release the collector.
+
+Instance deletion and security-group detachment are asynchronous. Destruction
+waits up to 10 minutes per region for security-group dependencies to clear;
+unrelated API errors still fail immediately. If an earlier attempt failed after
+deleting the instance, rerun `fab collector-destroy` to remove orphan collector
+security groups.
 
 ## Project Structure
 

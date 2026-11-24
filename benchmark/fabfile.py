@@ -1,4 +1,5 @@
 from fabric import task
+from invoke.exceptions import Exit
 
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
@@ -6,6 +7,7 @@ from benchmark.utils import BenchError, Print
 from benchmark.plot import Ploter, PlotError
 from alibaba.instance import InstanceManager
 from alibaba.remote import Bench
+from alibaba.collector import Collector
 
 
 @task
@@ -171,3 +173,54 @@ def logs(ctx):
         print(LogParser.process('./logs').result())
     except ParseError as e:
         Print.error(BenchError('Failed to parse logs', e))
+
+
+def _collector_command(ctx, operation, **kwargs):
+    try:
+        return getattr(Collector(ctx), operation)(**kwargs)
+    except Exception as error:
+        failure = error if isinstance(error, BenchError) else BenchError('Collector command failed', error)
+        Print.error(failure)
+        raise Exit(code=1) from error
+
+
+@task
+def collector_create(ctx):
+    ''' Create or reuse the independent collector (starts it if stopped) '''
+    _collector_command(ctx, 'create')
+
+
+@task
+def collector_setup(ctx):
+    ''' Install Jcarus/Python and copy configured SSH/Alibaba credentials '''
+    _collector_command(ctx, 'setup')
+
+
+@task
+def collector_ssh(ctx):
+    ''' Open an interactive SSH shell in the collector benchmark directory '''
+    _collector_command(ctx, 'ssh')
+
+
+@task
+def collector_download(ctx, directory=''):
+    ''' Download all collector results into a new unique directory '''
+    _collector_command(ctx, 'download', directory=directory, snapshot=True)
+
+
+@task
+def collector_sync(ctx, directory=''):
+    ''' Pull changed results; remote overwrites local, without deleting local files '''
+    _collector_command(ctx, 'download', directory=directory, snapshot=False)
+
+
+@task
+def collector_info(ctx):
+    ''' Display collector identity, status, SSH command and result directories '''
+    _collector_command(ctx, 'info')
+
+
+@task
+def collector_destroy(ctx):
+    ''' Destroy only the collector after typing its identity to confirm '''
+    _collector_command(ctx, 'destroy')

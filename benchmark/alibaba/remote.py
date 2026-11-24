@@ -14,6 +14,7 @@ from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
 from alibaba.instance import InstanceManager
+from alibaba.install import installation_command
 
 class FabricError(Exception):
     ''' Wrapper for Fabric exception with a meaningfull error message. '''
@@ -48,32 +49,10 @@ class Bench:
 
     def install(self):
         Print.info('Installing rust and cloning the repo...')
-        repo = quote(join('.', self.settings.repo_name))
-        branch = quote(self.settings.branch)
-        url = quote(self.settings.repo_url)
-        cmd = [
-            'if [ "$(id -u)" -eq 0 ]; then SUDO=; else SUDO=sudo; fi',
-            'if command -v cloud-init >/dev/null 2>&1; then $SUDO cloud-init status --wait; fi',
-            '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update',
-            '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 '
-            'install -y tmux git curl ca-certificates build-essential cmake clang pkg-config libssl-dev',
-
-            # Install rust (non-interactive) for the configured SSH user.
-            'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
-            '. "$HOME/.cargo/env"',
-            'rustup default stable',
-
-            # Clone or update the configured branch in the configured directory.
-            f'if [ -d {repo}/.git ]; then '
-            f'git -C {repo} fetch -f origin && '
-            f'git -C {repo} checkout -f {branch} && '
-            f'git -C {repo} pull --ff-only origin {branch}; '
-            f'else git clone --branch {branch} -- {url} {repo}; fi'
-        ]
         hosts = self.manager.hosts(flat=True)
         try:
             g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
-            g.run(' && '.join(cmd), hide=False)
+            g.run(installation_command(self.settings), hide=False)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
         except (GroupException, ExecutionError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e

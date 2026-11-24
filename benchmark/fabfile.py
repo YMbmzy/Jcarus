@@ -96,7 +96,7 @@ def info(ctx):
 
 @task
 def install(ctx):
-    ''' Install Icarus on all machines '''
+    ''' Prepare all machines (cloud-init, tmux) to run uploaded binaries '''
     try:
         Bench(ctx).install()
     except BenchError as e:

@@ -1,6 +1,10 @@
-from fabric import Connection, ThreadingGroup as Group
+from concurrent.futures import ThreadPoolExecutor
+from fabric import Connection, GroupResult, ThreadingGroup as Group
 from fabric.exceptions import GroupException
+from hashlib import sha256
 from os.path import basename, splitext
+from pathlib import Path
+import platform
 from time import sleep
 from math import ceil
 from itertools import zip_longest
@@ -14,7 +18,7 @@ from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
 from alibaba.instance import InstanceManager
-from alibaba.install import installation_command
+from alibaba.install import node_installation_command
 
 class FabricError(Exception):
     ''' Wrapper for Fabric exception with a meaningfull error message. '''
@@ -48,11 +52,11 @@ class Bench:
                 raise ExecutionError(output.stderr)
 
     def install(self):
-        Print.info('Installing rust and cloning the repo...')
+        Print.info('Preparing nodes (cloud-init, tmux)...')
         hosts = self.manager.hosts(flat=True)
         try:
             g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
-            g.run(installation_command(self.settings), hide=False)
+            g.run(node_installation_command(), hide=False)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
         except (GroupException, ExecutionError) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
@@ -85,33 +89,76 @@ class Bench:
         ]
         return ordered[:nodes]
 
-    def _background_run(self, host, command, log_file):
+    def _parallel(self, hosts, task, prefix=None):
+        ''' Run task(index, connection) on all hosts concurrently, like Group. '''
+        connections = [
+            Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
+            for host in hosts
+        ]
+
+        def work(index, c):
+            try:
+                return task(index, c)
+            finally:
+                c.close()
+
+        with ThreadPoolExecutor(max_workers=max(len(hosts), 1)) as pool:
+            futures = [pool.submit(work, i, c) for i, c in enumerate(connections)]
+            for future in progress_bar(futures, prefix=prefix) if prefix else futures:
+                future.exception()  # Wait for completion.
+
+        # Like ThreadingGroup, list failures last so FabricError reports one.
+        results, failures = GroupResult(), {}
+        for host, future in zip(hosts, futures):
+            if future.exception() is None:
+                results[host] = future.result()
+            else:
+                failures[host] = future.exception()
+        if failures:
+            results.update(failures)
+            raise GroupException(results)
+        return results
+
+    def _background_run(self, c, command, log_file):
         name = splitext(basename(log_file))[0]
         pipeline = f'{command} 2>&1 | tee {quote(log_file)}'
         shell_command = f'sh -c {quote(pipeline)}'
         cmd = f'tmux new -d -s {quote(name)} {quote(shell_command)}'
-        c = Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
 
     def _update(self, hosts):
-        Print.info(
-            f'Updating {len(hosts)} nodes (branch "{self.settings.branch}")...'
+        if (platform.system(), platform.machine()) != ('Linux', 'x86_64'):
+            raise BenchError(
+                'fab remote must run on the collector',
+                OSError('Testbed nodes run Linux x86_64 binaries built by the controller'),
+            )
+        Print.info(f'Building branch "{self.settings.branch}" on the controller...')
+        # Never force: collector-setup leaves uploaded scripts/settings as local
+        # changes, so stop on conflicts instead of discarding them.
+        for cmd in (['fetch', '--quiet', 'origin'],
+                    ['checkout', '--quiet', self.settings.branch],
+                    ['pull', '--quiet', '--ff-only', 'origin', self.settings.branch]):
+            subprocess.run(['git', '-C', '..', *cmd], check=True)
+        subprocess.run(CommandMaker.compile().split(), check=True, cwd=PathMaker.node_crate_path())
+        cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
+        subprocess.run([cmd], shell=True)
+
+        # Upload the same binaries to every node, skipping unchanged ones.
+        binaries = ['node', 'client']
+        expected = ''.join(
+            f'{sha256(Path(PathMaker.binary_path(), name).read_bytes()).hexdigest()}  {name}\n'
+            for name in binaries
         )
-        repo = quote(join('.', self.settings.repo_name))
-        branch = quote(self.settings.branch)
-        cmd = [
-            f'git -C {repo} fetch -f origin',
-            f'git -C {repo} checkout -f {branch}',
-            f'git -C {repo} pull --ff-only origin {branch}',
-            '. "$HOME/.cargo/env"',
-            f'(cd {quote(join(self.settings.repo_name, "node"))} && {CommandMaker.compile()})',
-            '(' + CommandMaker.alias_binaries(
-                quote(join('.', self.settings.repo_name, 'target', 'release'))
-            ) + ')'
-        ]
-        g = Group(*hosts, user=self.settings.ssh_user, connect_kwargs=self.connect)
-        g.run(' && '.join(cmd), hide=True)
+
+        def upload(i, c):
+            if c.run(f'sha256sum {" ".join(binaries)}', hide=True, warn=True).stdout == expected:
+                return
+            for name in binaries:
+                c.put(join(PathMaker.binary_path(), name), f'.{name}.upload')
+            # Rename over old files/symlinks: works even if a binary is still running.
+            c.run(' && '.join(f'mv -f .{name}.upload {name}' for name in binaries), hide=True)
+        self._parallel(hosts, upload, prefix=f'Uploading binaries to {len(hosts)} nodes:')
 
     def _config(self, hosts, node_parameters):
         Print.info('Generating configuration files...')
@@ -119,14 +166,6 @@ class Bench:
         # Cleanup all local configuration files.
         cmd = CommandMaker.cleanup()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
-
-        # Recompile the latest code.
-        cmd = CommandMaker.compile().split()
-        subprocess.run(cmd, check=True, cwd=PathMaker.node_crate_path())
-
-        # Create alias for the client and nodes binary.
-        cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
-        subprocess.run([cmd], shell=True)
 
         # Generate configuration files.
         keys = []
@@ -164,13 +203,12 @@ class Bench:
         g.run(cmd, hide=True)
 
         # Upload configuration files.
-        progress = progress_bar(hosts, prefix='Uploading config files:')
-        for i, host in enumerate(progress):
-            c = Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
+        def upload(i, c):
             c.put(PathMaker.committee_file(), '.')
             c.put(PathMaker.key_file(i), '.')
             c.put(PathMaker.threshold_key_file(i), '.')
             c.put(PathMaker.parameters_file(), '.')
+        self._parallel(hosts, upload, prefix='Uploading config files:')
 
         return committee
 
@@ -197,8 +235,8 @@ class Bench:
         timeout = node_parameters.timeout_delay
         node_sync = node_parameters.node_sync_delay
         client_logs = [PathMaker.client_log_file(i, ts) for i in range(len(hosts))]
-        for host, addr, log_file in zip(hosts, addresses, client_logs):
-            cmd = CommandMaker.run_client(
+        client_cmds = [
+            CommandMaker.run_client(
                 addr,
                 bench_parameters.tx_size,
                 rate_share,
@@ -206,7 +244,11 @@ class Bench:
                 node_sync,
                 nodes=addresses
             )
-            self._background_run(host, cmd, log_file)
+            for addr in addresses
+        ]
+        self._parallel(
+            hosts, lambda i, c: self._background_run(c, client_cmds[i], client_logs[i])
+        )
 
         Print.info('Clients boosted...')
         sleep(10)
@@ -216,8 +258,8 @@ class Bench:
         dbs = [PathMaker.db_path(i) for i in range(len(hosts))]
         node_logs = [PathMaker.node_log_file(i, ts) for i in range(len(hosts))]
         threshold_key_files = [PathMaker.threshold_key_file(i) for i in range(len(hosts))]
-        for host, key_file, threshold_key_file, db, log_file in zip(hosts, key_files, threshold_key_files, dbs, node_logs):
-            cmd = CommandMaker.run_node(
+        node_cmds = [
+            CommandMaker.run_node(
                 key_file,
                 threshold_key_file,
                 PathMaker.committee_file(),
@@ -225,7 +267,11 @@ class Bench:
                 PathMaker.parameters_file(),
                 debug=debug
             )
-            self._background_run(host, cmd, log_file)
+            for key_file, threshold_key_file, db in zip(key_files, threshold_key_files, dbs)
+        ]
+        self._parallel(
+            hosts, lambda i, c: self._background_run(c, node_cmds[i], node_logs[i])
+        )
 
         # Wait for the nodes to synchronize
         Print.info('Waiting for the nodes to synchronize...')
@@ -238,13 +284,12 @@ class Bench:
 
     def _logs(self, hosts, faults, ddos, ts):
         # Download log files.
-        progress = progress_bar(hosts, prefix='Downloading logs:')
-        for i, host in enumerate(progress):
-            c = Connection(host, user=self.settings.ssh_user, connect_kwargs=self.connect)
+        def download(i, c):
             c.get(PathMaker.node_log_file(i, ts), local=PathMaker.node_log_file(i, ts))
             c.get(
                 PathMaker.client_log_file(i, ts), local=PathMaker.client_log_file(i, ts)
             )
+        self._parallel(hosts, download, prefix='Downloading logs:')
 
         # Parse logs and return the parser.
         Print.info('Parsing logs and computing performance...')
@@ -265,12 +310,12 @@ class Bench:
             Print.warn('There are not enough instances available')
             return
 
-        # Update nodes.
+        # Build once and upload binaries to the nodes.
         try:
             self._update(selected_hosts)
-        except (GroupException, ExecutionError) as e:
+        except (OSError, subprocess.SubprocessError, GroupException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
-            raise BenchError('Failed to update nodes', e)
+            raise BenchError('Failed to build or upload binaries', e)
 
         Print.info('Running Icarus')
         Print.info(f'{bench_parameters.faults} faults')

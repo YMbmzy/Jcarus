@@ -266,15 +266,20 @@ disk, and public-traffic charges.
 fab create --nodes=7
 fab info
 # Verify a printed SSH command and complete peer ingress rules.
+# Then, on the collector (fab collector-ssh, see below):
 fab install
 fab remote
 ```
 
-`fab install` waits for cloud-init and installs tmux, Rust/build dependencies,
-and the configured repository. ECS must reach Ubuntu package mirrors, Rust
-servers, Cargo/Git dependencies, and that repository. Arrange private-repository
-authentication separately; AccessKeys do not grant Git access.
-Linux binaries are built on ECS; macOS binaries are not uploaded to Linux.
+Run `fab install` and `fab remote` on the collector. `fab install` only waits
+for cloud-init and makes sure tmux is present on each node. `fab remote`
+fast-forwards the collector's repository to `repo.branch`, compiles it once
+there, and uploads the `node`/`client` binaries to the selected nodes, skipping
+nodes whose binaries are unchanged. Nodes need no Rust toolchain or Git access.
+The collector must reach Ubuntu package mirrors, Rust servers, Cargo/Git
+dependencies, and the repository. Arrange private-repository authentication
+separately; AccessKeys do not grant Git access. `fab remote` refuses to run on
+machines other than Linux x86_64, such as macOS.
 
 Configure experiment size/rate/duration/faults in the `remote` task in
 `fabfile.py`. Its current default needs at least four running, publicly
@@ -338,11 +343,14 @@ Local cloud credentials therefore also need Hong Kong access and ECS
 `DescribeKeyPairs`/`ImportKeyPair` permissions, in addition to the cloud
 management/network permissions above. Creation stock checks are not reservations.
 
-`collector-setup` shares the normal `fab install` implementation, deploys the
-configured Jcarus repository at `~/Jcarus`, and installs Python 3.10, rsync, and
-`~/Jcarus/.venv` with `benchmark/requirements.txt`. Current local benchmark
-Python scripts are uploaded too, so new commands do not require a Git push.
-Rust sources on experiment nodes still come from `repo.url`/`repo.branch`.
+`collector-setup` installs the Rust toolchain, deploys the configured Jcarus
+repository at `~/Jcarus`, and installs Python 3.10, rsync, and `~/Jcarus/.venv`
+with `benchmark/requirements.txt`. Current local benchmark Python scripts are
+uploaded too, so new commands do not require a Git push. Rust sources still come
+from `repo.url`/`repo.branch`: push Rust changes and `fab remote` picks them up.
+Uploaded scripts/settings stay as local changes on the collector; `fab remote`
+never discards them and stops if a pushed commit conflicts with them. Rerun
+`fab collector-setup` in that case.
 The sample repository configuration points to `YMbmzy/Jcarus`.
 
 Setup copies exactly the configured `key.path` and `key.accesskey` files over

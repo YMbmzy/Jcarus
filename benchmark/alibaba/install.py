@@ -1,4 +1,4 @@
-"""Shared node installation and deployment of the independent collector."""
+"""Testbed node preparation and deployment of the independent collector."""
 
 from copy import copy
 from io import StringIO
@@ -10,21 +10,33 @@ from shlex import quote
 from alibaba.settings import Settings
 
 
+_PREPARE = [
+    'if [ "$(id -u)" -eq 0 ]; then SUDO=; else SUDO=sudo; fi',
+    'if command -v cloud-init >/dev/null 2>&1; then $SUDO cloud-init status --wait; fi',
+]
+_APT = '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300'
+
+
+def node_installation_command() -> str:
+    """Nodes only run binaries uploaded by the controller, supervised by tmux."""
+    return ' && '.join(_PREPARE + [
+        f'if ! command -v tmux >/dev/null 2>&1; then {_APT} update && {_APT} install -y tmux; fi',
+    ])
+
+
 def installation_command(settings) -> str:
-    """Return the same installation command for testbed nodes and collectors."""
+    """Return the Rust toolchain and repository installation command for the collector."""
     repo = quote(join('.', settings.repo_name))
     branch = quote(settings.branch)
     url = quote(settings.repo_url)
-    return ' && '.join([
-        'if [ "$(id -u)" -eq 0 ]; then SUDO=; else SUDO=sudo; fi',
-        'if command -v cloud-init >/dev/null 2>&1; then $SUDO cloud-init status --wait; fi',
-        '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 update',
-        '$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 '
-        'install -y tmux git curl ca-certificates build-essential cmake clang pkg-config libssl-dev',
+    return ' && '.join(_PREPARE + [
+        f'{_APT} update',
+        # librocksdb-sys needs a C++ compiler and libclang (bindgen) only.
+        f'{_APT} install -y --no-install-recommends tmux git curl ca-certificates build-essential clang',
         # Install rust (non-interactive) for the configured SSH user.
-        'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
+        'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | '
+        'sh -s -- -y --profile minimal --default-toolchain stable',
         '. "$HOME/.cargo/env"',
-        'rustup default stable',
         # Clone or update the configured branch in the configured directory.
         f'if [ -d {repo}/.git ]; then '
         f'git -C {repo} fetch -f origin && '

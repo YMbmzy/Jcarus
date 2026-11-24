@@ -107,17 +107,14 @@ impl Consensus {
             leader_elector.clone(),
         ); //对消息进行延迟
 
-        // Make the synchronizer. This instance runs in a background thread
-        // and asks other nodes for any block that we may be missing.
+        // Make the synchronizer, which asks other nodes for the blocks that
+        // we are still missing after `sync_retry_delay`.
         let synchronizer = Synchronizer::new(
             name,
             committee.clone(),
-            store.clone(),
             /* network_filter */ tx_filter.clone(),
-            /* core_channel */ tx_core.clone(),
             parameters.sync_retry_delay,
-        )
-        .await;
+        );
         sleep(Duration::from_millis(parameters.node_sync_delay)).await;
 
         tokio::spawn(async move {
@@ -132,9 +129,9 @@ impl Consensus {
                 mempool_driver,
                 synchronizer,
                 /* core_channel */ rx_core,
-                rx_smvba,
+                /* fast_channel */ rx_smvba,
                 /* network_filter */ tx_filter,
-                tx_filter_smvba,
+                /* network_filter_fast */ tx_filter_smvba,
                 /* commit_channel */ tx_commit,
             ).run().await;
         });

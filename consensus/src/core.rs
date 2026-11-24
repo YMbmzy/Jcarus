@@ -1,76 +1,42 @@
 use crate::aggregator::Aggregator;
-use crate::config::{Committee, Parameters};
+use crate::committer::{CommittedSubDag, Committer};
+use crate::config::{Committee, Parameters, Stake};
+use crate::dag::Dag;
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::filter::FilterInput;
 use crate::leader::LeaderElector;
 use crate::mempool::MempoolDriver;
-use crate::messages::{ABAProof, ABAVal, Block, RandomnessShare, Timeout, Vote, QC, TC};
+use crate::messages::{phase_of, round_of, wave_of, Block, Certificate, CoinShare, Vote, QC, R1, R2, R3};
 use crate::synchronizer::Synchronizer;
-use async_recursion::async_recursion;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::cmp::max;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::min;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use store::Store;
 use threshold_crypto::PublicKeySet;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, sleep_until, Duration, Instant};
 
-pub type SeqNumber = u64; 
+pub type SeqNumber = u64;
 
-const NEXT_EPOCH_HEIGHT: u64 = 10;
-pub const INIT_PHASE: u8 = 0;
-pub const PREPARE_PHASE: u8 = 1;
-pub const VAL_PHASE: u8 = 2;
-pub const AUX_PHASE: u8 = 3;
-pub const COIN_PHASE: u8 = 4;
+// Blocks travel on the consensus port. Votes and certificates use the second
+// (former SMVBA) port so that they are not queued behind blocks.
+pub const BLOCK_CHANNEL: u8 = 0;
+pub const FAST_CHANNEL: u8 = 1;
 
-pub const HOTSTUFF: u8 = 0;
-pub const TCVBA: u8 = 1;
+// Number of rounds kept below the latest committed leader.
+pub const GC_DEPTH: SeqNumber = 50;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ConsensusMessage {
     Propose(Block),
     Vote(Vote),
+    Certificate(Certificate),
     LoopBack(Block),
-    SyncRequest(Digest, PublicKey),
+    SyncRequest(Vec<Digest>, PublicKey),
     SyncReply(Block),
-    Timeout(Timeout),
-    TC(TC),
-    ABAVal(ABAVal),
-    ABAProof(ABAProof),
-    ABACoinShare(RandomnessShare),
-}
-
-#[derive(Clone)]
-pub struct Chain {
-    name: PublicKey,
-    height: SeqNumber,
-    last_voted_height: SeqNumber,
-    last_committed_height: SeqNumber,
-    last_pending_height: SeqNumber,
-    aggregator: Aggregator,
-    high_qc: QC,
-    height_to_digest: HashMap<SeqNumber, Digest>,
-    epoch: SeqNumber,
-}
-
-impl Chain {
-    pub fn new(name: PublicKey, committee: Committee) -> Self {
-        Self {
-            name,
-            height: 0,
-            last_voted_height: 0,
-            last_committed_height: 0,
-            last_pending_height: 0,
-            aggregator: Aggregator::new(committee),
-            high_qc: QC::genesis(),
-            height_to_digest: HashMap::new(),
-            epoch: 0,
-        }
-    }
 }
 
 pub struct Core {
@@ -84,36 +50,27 @@ pub struct Core {
     mempool_driver: MempoolDriver,
     synchronizer: Synchronizer,
     core_channel: Receiver<ConsensusMessage>,
-    smvba_channel: Receiver<ConsensusMessage>,
+    fast_channel: Receiver<ConsensusMessage>,
     network_filter: Sender<FilterInput>,
-    network_filter_smvba: Sender<FilterInput>,
+    network_filter_fast: Sender<FilterInput>,
     commit_channel: Sender<Block>,
-    epoch: SeqNumber,
-    total_epoch: SeqNumber,
-    tc_processed: bool,
-    prepare_proof_processed: bool,
-    val_value_broadcasted: bool, // val_1
-    aux_value_broadcasted: bool, // val_2
-    coin_share_broadcasted: bool,
-    aux_proof_broadcasted: bool,
-    is_view_change: bool,
-    pubkey_to_chain: HashMap<PublicKey, Chain>,
-    tc_cache: HashMap<SeqNumber, TC>, // epoch
-    aba_help_proof0_cache: HashMap<SeqNumber, ABAProof>,
-    aba_help_proof1_cache: HashMap<SeqNumber, ABAProof>,
-    aba_prepare_proof_cache: HashMap<SeqNumber, ABAProof>,
     aggregator: Aggregator,
-    bin_values: HashSet<u64>,
-    aba_round: SeqNumber,
-    phase: u8,
-    aba_output_val: Option<u64>, 
-    aba_prepare_set: Vec<SeqNumber>,
-    aba_input_val: HashMap<SeqNumber, u64>, // round -> value
-    aba_val_phase_cache1: HashMap<(SeqNumber, SeqNumber), ABAProof>,
-    aba_val_phase_cache2: HashMap<(SeqNumber, SeqNumber), ABAProof>,
-    aba_aux_phase_cache: HashMap<(SeqNumber, SeqNumber), ABAProof>, // 2f+1 aux values
-    aux_value_nums: HashMap<(SeqNumber, SeqNumber), u64>, // the number of values in set "values"
-    aba_coin_cache: HashMap<(SeqNumber, SeqNumber), usize>,
+    dag: Dag,
+    committer: Committer,
+    // Blocks waiting for their parents, with the number of missing parents.
+    pending: HashMap<Digest, (Block, usize)>,
+    // Missing parent -> blocks waiting for it.
+    waiting: HashMap<Digest, Vec<Digest>>,
+    last_proposed_round: SeqNumber,
+    last_proposal_time: Instant,
+    proposal_deadline: Option<Instant>,
+    my_blocks: HashMap<SeqNumber, Digest>, // round -> our block
+    my_qc1: HashMap<SeqNumber, QC>, // wave -> QC1 of our r1 block
+    qc2s: HashMap<(SeqNumber, PublicKey), Digest>, // (wave, author) -> r2 block with a QC2
+    leaders: BTreeMap<SeqNumber, PublicKey>, // wave -> leader
+    // Certified blocks (QC1 or QC2) of other nodes not yet covered by our blocks.
+    weak_candidates: BTreeSet<(SeqNumber, PublicKey)>,
+    commit_index: u64,
 }
 
 impl Core {
@@ -129,17 +86,12 @@ impl Core {
         mempool_driver: MempoolDriver,
         synchronizer: Synchronizer,
         core_channel: Receiver<ConsensusMessage>,
-        smvba_channel: Receiver<ConsensusMessage>,
+        fast_channel: Receiver<ConsensusMessage>,
         network_filter: Sender<FilterInput>,
-        network_filter_smvba: Sender<FilterInput>,
+        network_filter_fast: Sender<FilterInput>,
         commit_channel: Sender<Block>,
     ) -> Self {
         let aggregator = Aggregator::new(committee.clone());
-        let pubkey_to_chain = committee.authorities
-            .keys()
-            .map(|pk| {
-            (*pk, Chain::new(*pk, committee.clone()))
-        }).collect::<HashMap<_, _>>();
         Self {
             name,
             committee,
@@ -151,286 +103,138 @@ impl Core {
             mempool_driver,
             synchronizer,
             core_channel,
-            smvba_channel,
+            fast_channel,
             network_filter,
-            network_filter_smvba,
+            network_filter_fast,
             commit_channel,
-            epoch: 0,
-            total_epoch: 0,
-            tc_processed: false,
-            prepare_proof_processed: false,
-            val_value_broadcasted: false, // val_1
-            aux_value_broadcasted: false, // val_2
-            coin_share_broadcasted: false,
-            aux_proof_broadcasted: false,
-            is_view_change: false,
-            pubkey_to_chain: pubkey_to_chain,
-            tc_cache: HashMap::new(), // epoch
-            aba_help_proof0_cache: HashMap::new(),
-            aba_help_proof1_cache: HashMap::new(),
-            aba_prepare_proof_cache: HashMap::new(),
-            aggregator: aggregator,
-            bin_values: HashSet::new(),
-            aba_round: 1,
-            phase: INIT_PHASE,
-            aba_output_val: None, 
-            aba_prepare_set: Vec::new(),
-            aba_input_val: HashMap::new(), // round -> value
-            aba_val_phase_cache1: HashMap::new(),
-            aba_val_phase_cache2: HashMap::new(),
-            aba_aux_phase_cache: HashMap::new(), // 2f+1 aux values
-            aux_value_nums: HashMap::new(), // the number of values in set "values"
-            aba_coin_cache: HashMap::new(),
+            aggregator,
+            dag: Dag::new(),
+            committer: Committer::new(GC_DEPTH),
+            pending: HashMap::new(),
+            waiting: HashMap::new(),
+            last_proposed_round: 0,
+            last_proposal_time: Instant::now(),
+            proposal_deadline: None,
+            my_blocks: HashMap::new(),
+            my_qc1: HashMap::new(),
+            qc2s: HashMap::new(),
+            leaders: BTreeMap::new(),
+            weak_candidates: BTreeSet::new(),
+            commit_index: 0,
         }
     }
 
-    async fn store_block(&mut self, block: &Block) {
-        debug!("Storing block {:?}", block);
-        let key = block.digest().to_vec();
+    async fn store_block(&mut self, digest: &Digest, block: &Block) {
         let value = bincode::serialize(block).expect("Failed to serialize block");
-        self.store.write(key, value).await;
+        self.store.write(digest.to_vec(), value).await;
     }
 
-    fn increase_last_voted_round(&mut self, target: SeqNumber, chain: &mut Chain) {
-        chain.last_voted_height = max(chain.last_voted_height, target);
+    fn has_quorum(&self, round: SeqNumber) -> bool {
+        let stake: Stake = self
+            .dag
+            .round(round)
+            .map(|(_, block)| self.committee.stake(&block.author))
+            .sum();
+        stake >= self.committee.quorum_threshold()
     }
 
-    async fn make_vote(&mut self, block: &Block, chain: &mut Chain) -> Option<Vote> {
-        // We can not vote for a block whose epoch smaller.
-        if chain.epoch > block.epoch {
-            debug!("FailVote 1, chain.epoch: {}, block.epoch: {}", chain.epoch, block.epoch);
-            return None;
-        }
-        // If we are changing view, we can not vote for current leader chain blocks.
-        if self.is_view_change && block.author == self.leader_elector.get_leader(self.epoch) {
-            debug!("FailVote 2, view-change: {}, block.author: {}, leader: {}", 
-                self.is_view_change, block.author, self.leader_elector.get_leader(self.epoch));
-            return None;
-        }
-        // Check if we can vote for this block.
-        let safety_rule_1 = block.height > chain.last_voted_height;
-        // Consider view-change.
-        let safety_rule_2 = block.qc.height + 1 == block.height || block.qc == QC::genesis();
-
-        if !(safety_rule_1 && safety_rule_2) {
-            if !safety_rule_1 {
-                debug!("FailVote 3, block.height: {}, chain.last_voted_height: {}", block.height, chain.last_voted_height);
-            } else {
-                debug!("FailVote 4, block.qc: {:?}, block.height: {}", block.qc, block.height);
-            } 
-            return None;
-        }
-
-        // Ensure we won't vote for contradicting blocks.
-        self.increase_last_voted_round(block.height, chain);
-        // TODO [issue #15]: Write to storage preferred_round and last_voted_round.
-        Some(Vote::new(block, self.name, self.signature_service.clone()).await)
-    }
-
-    #[async_recursion]
-    async fn commit_prev_block(&mut self, block: &Block, chain: &mut Chain, to_commit: &mut VecDeque<Block>) -> ConsensusResult<bool> {
-        if chain.last_committed_height >= block.height {
-            return Ok(true);
-        }
- 
-        while chain.last_committed_height < block.height {
-            if let None = chain.height_to_digest.get(&(chain.last_committed_height + 1)) {
-                return Ok(false);
+    // Proposes the next rounds, one by one, as long as their conditions hold:
+    // r1: 2f+1 r3 blocks of the previous wave;
+    // r2: 2f+1 r1 blocks, including our own r1 block with its QC1;
+    // r3: the wave leader is revealed and 2f+1 r2 blocks.
+    async fn try_advance(&mut self) -> ConsensusResult<()> {
+        loop {
+            let round = self.last_proposed_round + 1;
+            let wave = wave_of(round);
+            let ready = match phase_of(round) {
+                R1 => round == 1 || self.has_quorum(round - 1),
+                R2 => self.my_qc1.contains_key(&wave) && self.has_quorum(round - 1),
+                _ => self.leaders.contains_key(&wave) && self.has_quorum(round - 1),
+            };
+            if !ready {
+                return Ok(());
             }
-            let current_digest = chain.height_to_digest.get(&(chain.last_committed_height + 1)).unwrap();
-            if let None = self.synchronizer.get_block(self.name, current_digest, None).await? {
-                return Ok(false);
-            }
-            let mut current_block = self.synchronizer.get_block(self.name, current_digest, None).await?.unwrap();
-            if current_block.author == self.leader_elector.get_leader(self.epoch) {
-                current_block.references.sort_by_key(|(pk, _, _)| *pk); // maybe no need.
-                for (_, digest, _) in &current_block.references {
-                    match self.synchronizer.get_block(self.name, digest, None).await? {
-                        Some(block) => {
-                            let mut target = self.pubkey_to_chain.get(&block.author).cloned().unwrap();
-                            if !self.commit_prev_block(&block, &mut target, to_commit).await? {
-                                return Ok(false);
-                            }
-                            self.pubkey_to_chain.insert(block.author, target);
-                        },
-                        None => return Ok(false),
-                    }
+            if self.parameters.min_block_delay > 0 {
+                let deadline =
+                    self.last_proposal_time + Duration::from_millis(self.parameters.min_block_delay);
+                if Instant::now() < deadline {
+                    self.proposal_deadline = Some(deadline);
+                    return Ok(());
                 }
             }
-            to_commit.push_front(current_block.clone());
-            chain.last_committed_height += 1;
-        }
-
-        Ok(true)
-    }
-
-    #[async_recursion]
-    async fn commit(&mut self, block: Block, chain: &mut Chain) -> ConsensusResult<()> {
-        let mut to_commit = VecDeque::new();
-        if !self.commit_prev_block(&block, chain, &mut to_commit).await? {
-            debug!("Failed to commit block");
-        }
-
-        // Send all the newly committed blocks to the node's application layer.
-        while let Some(block) = to_commit.pop_back() {
-            info!("Committed {:?}", block);
-            if !block.payload.is_empty() {
-                info!("Committed {}", block);
-
-                // Cleanup the mempool.
-                self.mempool_driver.cleanup(&block).await;
-
-                #[cfg(feature = "benchmark")]
-                for x in &block.payload {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", block, x);
-                }
-            }
-            debug!("Committed {:?}", block);
-            if let Err(e) = self.commit_channel.send(block).await {
-                warn!("Failed to send block through the commit channel: {}", e);
-            }
-        }
-        Ok(())
-    }
-
-    fn update_high_qc(&mut self, qc: &QC, chain: &mut Chain) {
-        debug!("Processing update qc: {:?}", qc);
-        chain.height_to_digest.insert(qc.height, qc.hash.clone());
-        if qc.height > chain.high_qc.height {
-            chain.high_qc = qc.clone();
+            self.propose(round).await?;
         }
     }
 
-    fn update_last_pending_height(&mut self, block: &Block, chain: &mut Chain) {
-        if block.height > chain.last_pending_height {
-            chain.last_pending_height = block.height;
+    // Weak references: certified blocks not reachable from the strong references.
+    fn weak_references(
+        &mut self,
+        round: SeqNumber,
+        strong: &[(PublicKey, Digest, SeqNumber)],
+    ) -> Vec<(PublicKey, Digest, SeqNumber)> {
+        if round < 3 {
+            return Vec::new();
         }
-        for (name, _, height) in &block.references {
-            if let Some(target) = self.pubkey_to_chain.get_mut(name) {
-                if *height > target.last_pending_height {
-                    target.last_pending_height = *height;
+        let max_round = round - 2;
+        let mut covered = Vec::new();
+        let mut candidates = Vec::new();
+        for (candidate_round, author) in self
+            .weak_candidates
+            .iter()
+            .take_while(|(candidate_round, _)| *candidate_round <= max_round)
+        {
+            // Certified blocks we do not have yet stay candidates.
+            if let Some((digest, _)) = self.dag.get_at(*candidate_round, author) {
+                covered.push((*candidate_round, *author));
+                if !self.committer.is_committed(digest) {
+                    candidates.push((*author, digest.clone(), *candidate_round));
                 }
             }
         }
-    }
-
-    async fn local_timeout_round(&mut self, chain: &mut Chain) -> ConsensusResult<()> {
-        warn!("Timeout reached for chain {}, height {}", chain.name, chain.height);
-
-        // Increase the last voted round.
-        self.increase_last_voted_round(chain.height, chain);
-
-        // Make a timeout message.
-        let timeout = Timeout::new(
-            chain.high_qc.clone(),
-            self.epoch,
-            self.name,
-            self.signature_service.clone(),
-        )
-        .await;
-        debug!("Created {:?}", timeout);
-
-        // Broadcast the timeout message.
-        let message = ConsensusMessage::Timeout(timeout.clone());
-        Synchronizer::transmit(
-            message,
-            &self.name,
-            None,
-            &self.network_filter_smvba,
-            &self.committee,
-            TCVBA,
-        ).await?;
-
-        // Process our message.
-        self.handle_timeout(&timeout, chain).await
-    }
-
-    #[async_recursion]
-    async fn handle_vote(&mut self, vote: &Vote, chain: &mut Chain) -> ConsensusResult<()> {
-        debug!("Processing {:?}", vote);
-        // Vote handle condition
-        if vote.height < chain.height {
-            return Ok(());
+        // After this block, every candidate in our DAG is covered by it.
+        for key in &covered {
+            self.weak_candidates.remove(key);
+        }
+        if candidates.is_empty() {
+            return Vec::new();
         }
 
-        // Ensure the vote is well formed.
-        vote.verify(&self.committee)?;
-
-        // Add the new vote to our aggregator and see if we have a quorum.
-        if let Some(qc) = chain.aggregator.add_vote(vote.clone())? {
-            debug!("Assembled {:?}", qc);
-
-            // Process the QC.
-            self.process_qc(&qc, chain).await;
-
-            // Make a new block.
-            let block = self.generate_proposal(chain, false).await;
-            self.broadcast_propose(block, chain).await?;
-        }
-        Ok(())
-    }
-
-    async fn handle_timeout(&mut self, timeout: &Timeout, chain: &mut Chain) -> ConsensusResult<()> {
-        debug!("Processing {:?}", timeout);
-
-        if timeout.epoch < self.epoch {
-            return Ok(());
-        }
-
-        // Ensure the timeout is well formed.
-        timeout.verify(&self.committee)?;
-
-        // Process the QC embedded in the timeout.
-        self.process_qc(&timeout.high_qc, chain).await;
-
-        // Add the new vote to our aggregator and see if we have a quorum.
-        if let Some(tc) = chain.aggregator.add_timeout(timeout.clone())? {
-            debug!("Assembled {:?}", tc);
-
-            // Save tc.
-            self.tc_cache.insert(tc.epoch, tc.clone());
-        }
-        Ok(())
-    }
-
-    #[async_recursion]
-    async fn advance_height(&mut self, height: SeqNumber, chain: &mut Chain) {
-        if height < chain.height {
-            return;
-        }
-        chain.height = height;
-        if chain.name == self.leader_elector.get_leader(self.epoch) {
-            debug!("Leader Chain {} moved to height {}", chain.name, chain.height);
-        } else {
-            debug!("Chain {} moved to height {}", chain.name, chain.height);
-        }
-
-        // Cleanup the vote aggregator.
-        chain.aggregator.cleanup(&self.epoch, &chain.height);
-    }
-
-    #[async_recursion]
-    async fn generate_proposal(&mut self, chain: &Chain, tag: bool) -> Block {
-        let references: Vec<(PublicKey, Digest, SeqNumber)> = self
-            .committee
-            .authorities
-            .keys()
-            .filter(|name| *name != &chain.name)
-            .filter_map(|name| {
-                let chain = self.pubkey_to_chain.get(name)?;
-                if chain.high_qc == QC::genesis() {
-                    return None;
-                }
-                Some((*name, chain.high_qc.hash.clone(), chain.high_qc.height))
-            })
+        let min_round = candidates.iter().map(|(_, _, round)| *round).min().unwrap();
+        let strong: Vec<Digest> = strong.iter().map(|(_, digest, _)| digest.clone()).collect();
+        let committer = &self.committer;
+        let reachable: HashSet<Digest> = self
+            .dag
+            .causal_history(&strong, min_round, |digest| committer.is_committed(digest))
+            .into_iter()
             .collect();
-        let qc = if tag {
-            QC::genesis()
-        } else {
-            chain.high_qc.clone()
+        candidates
+            .into_iter()
+            .filter(|(_, digest, _)| !reachable.contains(digest))
+            .collect()
+    }
+
+    async fn propose(&mut self, round: SeqNumber) -> ConsensusResult<()> {
+        let wave = wave_of(round);
+        let phase = phase_of(round);
+
+        // Strong references: every block of the previous round in our view.
+        let mut references: Vec<(PublicKey, Digest, SeqNumber)> = self
+            .dag
+            .round(round - 1)
+            .map(|(digest, block)| (block.author, digest.clone(), round - 1))
+            .collect();
+        let weak = self.weak_references(round, &references);
+        references.extend(weak);
+        let qc = match phase {
+            R2 => self.my_qc1[&wave].clone(),
+            _ => QC::genesis(),
         };
-        // Make block
+        // From now on, we no longer vote for the r2 block of the wave leader
+        // if this is our r3 block (exit vote).
+        self.last_proposed_round = round;
+        self.last_proposal_time = Instant::now();
+
+        // Make the block.
         let payload = self
             .mempool_driver
             .get(self.parameters.max_payload_size)
@@ -438,13 +242,13 @@ impl Core {
         let block = Block::new(
             qc,
             self.name,
-            chain.height + 1,
-            chain.epoch,
-            self.epoch,
+            round,
             payload,
             references,
             self.signature_service.clone(),
-        ).await;
+        )
+        .await;
+        let digest = block.digest();
 
         if !block.payload.is_empty() {
             info!("Created {}", block);
@@ -456,11 +260,8 @@ impl Core {
             }
         }
         debug!("Created {:?}", block);
+        self.my_blocks.insert(round, digest.clone());
 
-        block
-    }
-
-    async fn broadcast_propose(&mut self, block: Block, chain: &mut Chain) -> ConsensusResult<()> {
         // Broadcast our new block.
         let message = ConsensusMessage::Propose(block.clone());
         Synchronizer::transmit(
@@ -469,124 +270,22 @@ impl Core {
             None,
             &self.network_filter,
             &self.committee,
-            HOTSTUFF,
+            BLOCK_CHANNEL,
         )
         .await?;
 
-        self.process_block(&block, chain).await?;
-
-        // Wait for the minimum block delay.
-        sleep(Duration::from_millis(self.parameters.min_block_delay)).await;
-        Ok(())
+        // Our own payload is already in the mempool's store.
+        self.insert_blocks(digest, block).await
     }
 
-    async fn process_qc(&mut self, qc: &QC, chain: &mut Chain) {
-        // self.advance_height(qc.height, chain).await;
-        self.update_high_qc(qc, chain);
-    }
-
-    async fn process_block_vote(&mut self, block: &Block, chain: &mut Chain) -> ConsensusResult<()> {
-        // Ensure the block's round is as expected.
-        // This check is important: it prevents bad leaders from producing blocks
-        // far in the future that may cause overflow on the round number.
-        if block.height == chain.height || block.qc == QC::genesis() {
-            // See if we can vote for this block.
-            // Block author is the qc maker.
-            if let Some(vote) = self.make_vote(block, chain).await {
-                debug!("Created {:?}", vote);
-                if vote.proposer == self.name {
-                    self.handle_vote(&vote, chain).await?;
-                } else {
-                    let message = ConsensusMessage::Vote(vote.clone());
-                    Synchronizer::transmit(
-                        message,
-                        &self.name,
-                        Some(&vote.proposer),
-                        &self.network_filter,
-                        &self.committee,
-                        HOTSTUFF,
-                    ).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn process_block_prepare(&mut self, block: &Block) -> ConsensusResult<Option<(Block, Block)>> {
-        // Let's see if we have the last three ancestors of the block, that is:
-        //      b0 <- |qc0; b1| <- |qc1; block|
-        // If we don't, the synchronizer asks for them to other nodes. It will
-        // then ensure we process both ancestors in the correct order, and
-        // finally make us resume processing this block.
-        let (b0, b1) = match self.synchronizer.get_ancestors(block).await? {
-            Some(ancestors) => ancestors,
-            None => {
-                debug!("Processing of {} suspended: missing parent", block.digest());
-                return Ok(None);
-            }
-        };
-
-        Ok(Some((b0, b1)))
-    }
-
-    async fn process_block_commit(&mut self, b0: Block, b1: Block, chain: &mut Chain) -> ConsensusResult<()> {
-        // Check if we can commit the head of the 2-chain.
-        // Note that we commit blocks only if we have all its ancestors.
-        let leader = self.leader_elector.get_leader(self.epoch);
-        if leader == b0.author && b0.height + 1 == b1.height {
-            self.update_last_pending_height(&b0, chain);
-            self.commit(b0, chain).await?;
-        }    
-        Ok(())
-    }
-
-    #[async_recursion]
-    async fn process_block(&mut self, block: &Block, chain: &mut Chain) -> ConsensusResult<()> {
-        debug!("Processing {:?}", block);
-
-        self.advance_height(block.height, chain).await;
-        chain.height_to_digest.insert(block.height, block.digest());
-
-        // Store block immediately.
-        self.store_block(block).await;
-
-        // self.cleanup_proposer(block).await;
-
-        // If the block is not in the leader chain, no need to commit.
-        // debug!("leader: {}, block.author: {}", self.leader_elector.get_leader(self.epoch), block.author);
-        // We can not commit block whose epoch is not the current epoch.(or bigger)
-        if block.author == self.leader_elector.get_leader(self.epoch) {
-            if let Some((b0, b1)) = self.process_block_prepare(block).await? {
-                if !self.is_view_change && block.epoch <= chain.epoch {
-                   self.process_block_commit(b0, b1, chain).await?; 
-                }    
-            }
-        } else {
-            self.process_block_prepare(block).await?;
-        }
-        self.process_block_vote(block, chain).await?;
-
-        Ok(())
-    }
-
-    async fn handle_proposal(&mut self, block: &Block, chain: &mut Chain) -> ConsensusResult<()> {
+    async fn handle_proposal(&mut self, block: Block) -> ConsensusResult<()> {
         let digest = block.digest();
-
-        // Ensure the block proposer leads the chain.
-        ensure!(
-            block.author == chain.name,
-            ConsensusError::WrongAuthor {
-                digest,
-                author: block.author,
-                height: block.height
-            }
-        );
+        if self.is_known(&digest, &block) {
+            return Ok(());
+        }
 
         // Check the block is correctly formed.
         block.verify(&self.committee)?;
-
-        // Process the QC. This may allow us to advance round.
-        self.process_qc(&block.qc, chain).await;
 
         // Let's see if we have the block's data. If we don't, the mempool
         // will get it and then make us resume processing this block.
@@ -595,732 +294,351 @@ impl Core {
             return Ok(());
         }
 
-        // All check pass, we can process this block.
-        self.process_block(block, chain).await
+        self.process_block(digest, block).await
     }
 
-    async fn handle_tc(&mut self, tc: TC) -> ConsensusResult<()> {
-        if tc.epoch < self.epoch {
+    fn is_known(&self, digest: &Digest, block: &Block) -> bool {
+        block.height < self.dag.gc_round()
+            || self.dag.contains(digest)
+            || self.pending.contains_key(digest)
+    }
+
+    // Inserts the block in the DAG once all its parents are there.
+    async fn process_block(&mut self, digest: Digest, block: Block) -> ConsensusResult<()> {
+        if self.is_known(&digest, &block) {
             return Ok(());
         }
-        tc.verify(&self.committee)?;
+        self.synchronizer.received(&digest);
 
-        // Save tc.
-        self.tc_cache.insert(tc.epoch, tc.clone());
-
+        let missing = self.dag.missing_parents(&block);
+        if missing.is_empty() {
+            return self.insert_blocks(digest, block).await;
+        }
+        debug!("Processing of {} suspended: {} missing parents", digest, missing.len());
+        for (parent, round) in &missing {
+            self.waiting
+                .entry(parent.clone())
+                .or_insert_with(Vec::new)
+                .push(digest.clone());
+            if !self.pending.contains_key(parent) {
+                self.synchronizer.add_missing(parent.clone(), *round, block.author);
+            }
+        }
+        self.pending.insert(digest, (block, missing.len()));
         Ok(())
     }
 
-    async fn process_tc(&mut self, tc: TC) -> ConsensusResult<()> {
-        // No need to broadcast, because qc in 2f+1 timeout is needed.
-        // High qc is aba input.
-        let input_val = *tc.high_qc_rounds().iter().max().unwrap();
-        debug!("input_val: {}", input_val);
-        self.aba_input_val.insert(1, input_val);
-        // Broadcast the input.
-        let phase = if self.aba_round == 1 {PREPARE_PHASE} else {VAL_PHASE};
-        let aba_val = ABAVal::new(
-            self.name,
-            self.epoch,
-            1,
-            input_val,
-            phase,
-            self.signature_service.clone(),
-        ).await;
-        let message = ConsensusMessage::ABAVal(aba_val.clone());
-        Synchronizer::transmit(
-            message, 
-            &self.name, 
-            None, 
-            &self.network_filter_smvba, 
-            &self.committee,
-            TCVBA,
-        ).await?;
-        self.handle_aba_val(aba_val).await?;
+    // Inserts the block, then every pending block it unblocks.
+    async fn insert_blocks(&mut self, digest: Digest, block: Block) -> ConsensusResult<()> {
+        let mut ready = vec![(digest, block)];
+        while let Some((digest, block)) = ready.pop() {
+            self.store_block(&digest, &block).await;
+            self.synchronizer.received(&digest);
+            if let Err(e) = self.on_insert(&digest, &block).await {
+                warn!("{}", e);
+            }
+            self.dag.insert(digest.clone(), block);
 
-        Ok(())
-    }
-
-    pub async fn check_timeout(&mut self, chain: &mut Chain) -> ConsensusResult<()> {
-        // If we have tc, enter in view-change.
-        if self.tc_cache.contains_key(&self.epoch) {
-            if !self.is_view_change {
-                debug!("aba status start, epoch {}", self.epoch);
-                self.is_view_change = true;
-            }  
-        }
-        // If we are changing view, no need to send timeout.
-        if self.is_view_change {
-            return Ok(());
-        }
-
-        // If there is any chain's round greater than leader's, try to view change.
-        for (_, other_chain) in self.pubkey_to_chain.clone() {
-            if other_chain.name != chain.name && other_chain.last_pending_height + self.parameters.lambda < other_chain.height {
-                debug!("aba status start, epoch {}", self.epoch);
-                for (_, info_chain) in self.pubkey_to_chain.clone() {
-                    debug!("chain name {}, height {}", info_chain.name, info_chain.height);
+            if let Some(children) = self.waiting.remove(&digest) {
+                for child in children {
+                    if let Some((_, missing)) = self.pending.get_mut(&child) {
+                        *missing -= 1;
+                        if *missing == 0 {
+                            let (block, _) = self.pending.remove(&child).unwrap();
+                            ready.push((child, block));
+                        }
+                    }
                 }
-                debug!("chain {}: last pending height: {}, height: {}", other_chain.name, other_chain.last_pending_height, other_chain.height);
-                self.is_view_change = true;
-                self.local_timeout_round(chain).await?;
-                break;
             }
         }
         Ok(())
     }
 
-    pub fn is_expired_aba_message(&mut self, epoch: SeqNumber, round: SeqNumber) -> bool {
-        if self.aba_output_val.is_some() {
-            return true;
+    async fn on_insert(&mut self, digest: &Digest, block: &Block) -> ConsensusResult<()> {
+        // The QC1 embedded in an r2 block certifies its author's r1 block.
+        if block.phase() == R2 && block.author != self.name {
+            self.weak_candidates.insert((block.height - 1, block.author));
         }
-        epoch < self.epoch || (epoch == self.epoch && round < self.aba_round)
+        self.make_vote(digest, block).await
+    }
+
+    // We vote once for every r1 (PB) and r2 (CBC) block inserted in our DAG.
+    async fn make_vote(&mut self, digest: &Digest, block: &Block) -> ConsensusResult<()> {
+        let phase = block.phase();
+        if phase == R3 {
+            return Ok(());
+        }
+        // Exit vote: once our r3 block of the wave is out, we no longer vote
+        // for the r2 block of the wave leader.
+        let wave = block.wave();
+        if phase == R2
+            && self.last_proposed_round >= round_of(wave, R3)
+            && self.leaders.get(&wave) == Some(&block.author)
+        {
+            debug!("Exit vote for leader block {} of wave {}", digest, wave);
+            return Ok(());
+        }
+
+        let vote = Vote::new(digest.clone(), block, self.name, self.signature_service.clone()).await;
+        debug!("Created {:?}", vote);
+        if block.author == self.name {
+            return self.process_vote(vote).await;
+        }
+        let message = ConsensusMessage::Vote(vote);
+        Synchronizer::transmit(
+            message,
+            &self.name,
+            Some(&block.author),
+            &self.network_filter_fast,
+            &self.committee,
+            FAST_CHANNEL,
+        )
+        .await
+    }
+
+    async fn handle_vote(&mut self, vote: Vote) -> ConsensusResult<()> {
+        // Ignore votes for blocks that are not (or no longer) ours.
+        if vote.proposer != self.name || self.my_blocks.get(&vote.height) != Some(&vote.hash) {
+            return Ok(());
+        }
+
+        // Ensure the vote is well formed.
+        vote.verify(&self.committee)?;
+        self.process_vote(vote).await
+    }
+
+    async fn process_vote(&mut self, vote: Vote) -> ConsensusResult<()> {
+        // Add the new vote to our aggregator and see if we have a quorum.
+        let qc = match self.aggregator.add_vote(vote)? {
+            Some(qc) => qc,
+            None => return Ok(()),
+        };
+        debug!("Assembled {:?}", qc);
+        let wave = wave_of(qc.height);
+        if phase_of(qc.height) == R1 {
+            self.my_qc1.insert(wave, qc);
+            return Ok(());
+        }
+
+        // QC2: finish the CBC by broadcasting it with our coin share.
+        let coin = CoinShare::new(wave, self.name, self.signature_service.clone()).await;
+        let certificate = Certificate { qc, coin };
+        let message = ConsensusMessage::Certificate(certificate.clone());
+        Synchronizer::transmit(
+            message,
+            &self.name,
+            None,
+            &self.network_filter_fast,
+            &self.committee,
+            FAST_CHANNEL,
+        )
+        .await?;
+        self.process_certificate(certificate)
+    }
+
+    async fn handle_certificate(&mut self, certificate: Certificate) -> ConsensusResult<()> {
+        if certificate.qc.height < self.dag.gc_round() {
+            return Ok(());
+        }
+        certificate.qc.verify(&self.committee)?;
+        // Coin shares are only needed until the wave leader is revealed (and
+        // each verification costs a pairing).
+        if !self.leaders.contains_key(&wave_of(certificate.qc.height)) {
+            certificate.coin.verify(&self.committee, &self.pk_set)?;
+        }
+        self.process_certificate(certificate)
+    }
+
+    fn process_certificate(&mut self, certificate: Certificate) -> ConsensusResult<()> {
+        debug!("Processing {:?}", certificate);
+        let qc = certificate.qc;
+        let wave = wave_of(qc.height);
+        if qc.proposer != self.name {
+            self.weak_candidates.insert((qc.height, qc.proposer));
+        }
+        self.qc2s.insert((wave, qc.proposer), qc.hash);
+
+        // f+1 coin shares reveal the wave leader.
+        if self.leaders.contains_key(&wave) {
+            return Ok(());
+        }
+        if let Some(coin) = self.aggregator.add_coin_share(certificate.coin, &self.pk_set)? {
+            let leader = self.leader_elector.get_leader(coin as SeqNumber);
+            debug!("Leader of wave {} is {}", wave, leader);
+            self.leaders.insert(wave, leader);
+        }
+        Ok(())
+    }
+
+    // Direct commit: the wave leader's r2 block has a QC2 (and is in our DAG);
+    // its QC1 names the leader block (r1) to commit.
+    async fn try_commit(&mut self) -> ConsensusResult<()> {
+        loop {
+            let next_wave = self.committer.last_committed_wave() + 1;
+            let anchor = self.leaders.range(next_wave..).find_map(|(wave, leader)| {
+                let digest = self.qc2s.get(&(*wave, *leader))?;
+                Some(self.dag.get(digest)?.qc.hash.clone())
+            });
+            let anchor = match anchor {
+                Some(anchor) => anchor,
+                None => return Ok(()),
+            };
+            let leaders = &self.leaders;
+            let sub_dags = match self
+                .committer
+                .commit(&self.dag, &anchor, |wave| leaders.get(&wave).cloned())
+            {
+                Some(sub_dags) => sub_dags,
+                // Waiting for the leader of an earlier wave.
+                None => return Ok(()),
+            };
+            for sub_dag in sub_dags {
+                self.deliver(sub_dag).await;
+            }
+            self.cleanup();
+        }
+    }
+
+    async fn deliver(&mut self, sub_dag: CommittedSubDag) {
+        debug!(
+            "Committing leader {} of wave {} with {} blocks",
+            sub_dag.leader,
+            sub_dag.wave,
+            sub_dag.blocks.len()
+        );
+        let mut digests = Vec::new();
+        for (digest, block) in sub_dag.blocks {
+            self.commit_index += 1;
+            // NOTE: This log entry is used to check that all nodes commit the same sequence.
+            info!("Sequenced {} {} {} {}", self.commit_index, digest, block, block.author);
+            if !block.payload.is_empty() {
+                info!("Committed {}", block);
+
+                #[cfg(feature = "benchmark")]
+                for x in &block.payload {
+                    // NOTE: This log entry is used to compute performance.
+                    info!("Committed {} -> {:?}", block, x);
+                }
+                digests.extend(block.payload.iter().cloned());
+            }
+            if let Err(e) = self.commit_channel.send(block).await {
+                warn!("Failed to send block through the commit channel: {}", e);
+            }
+        }
+
+        // Cleanup the mempool. It drops pending payload requests of blocks up to
+        // this round, so only rounds that we no longer keep are passed.
+        let gc_round = self.committer.gc_round();
+        self.mempool_driver
+            .cleanup(digests, gc_round.saturating_sub(1))
+            .await;
+    }
+
+    fn cleanup(&mut self) {
+        let gc_round = self.committer.gc_round();
+        if gc_round <= self.dag.gc_round() {
+            return;
+        }
+        let gc_wave = wave_of(gc_round);
+        self.dag.gc(gc_round);
+        self.pending.retain(|_, (block, _)| block.height >= gc_round);
+        let pending = &self.pending;
+        self.waiting.retain(|_, children| {
+            children.retain(|child| pending.contains_key(child));
+            !children.is_empty()
+        });
+        self.synchronizer.cleanup(gc_round);
+        self.aggregator.cleanup(gc_round, gc_wave);
+        self.my_blocks.retain(|round, _| *round >= gc_round);
+        self.my_qc1.retain(|wave, _| *wave >= gc_wave);
+        self.qc2s.retain(|(wave, _), _| *wave >= gc_wave);
+        self.leaders.retain(|wave, _| *wave >= gc_wave);
+        self.weak_candidates.retain(|(round, _)| *round >= gc_round);
     }
 
     async fn handle_sync_request(
         &mut self,
-        digest: Digest,
+        digests: Vec<Digest>,
         sender: PublicKey,
     ) -> ConsensusResult<()> {
-        if let Some(bytes) = self.store.read(digest.to_vec()).await? {
-            let block = bincode::deserialize(&bytes)?;
-            let message = ConsensusMessage::SyncReply(block);
-            Synchronizer::transmit(
-                message,
-                &self.name,
-                Some(&sender),
-                &self.network_filter,
-                &self.committee,
-                HOTSTUFF,
-            ).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn handle_val_phase(&mut self, aba_val: ABAVal) -> ConsensusResult<()> {
-        debug!("Received aba_val {:?}", aba_val);
-        aba_val.verify()?;
-
-        if let Some(aba_proof) = self.aggregator.add_aba_val(aba_val.clone())? {
-            debug!("Assembled {:?}", aba_proof);
-            if aba_proof.tag == true {
-                self.aba_val_phase_cache1.insert((aba_proof.epoch, aba_proof.round), aba_proof);
-            } else {
-                debug!("Current epoch: {}, round: {}", self.epoch, self.aba_round);
-                self.aba_val_phase_cache2.insert((aba_proof.epoch, aba_proof.round), aba_proof);
-            } 
-        }
-        Ok(())
-    }
-
-    pub async fn handle_prepare_phase(&mut self, aba_val: ABAVal) -> ConsensusResult<()> {
-        debug!("Received prepare val {:?}", aba_val);
-        aba_val.verify()?;
-
-        self.aba_prepare_set.push(aba_val.val);
-        if let Some(proof) = self.aggregator.add_aba_val(aba_val.clone())? {
-            debug!("Assembled {:?}", proof);
-            if proof.val % 2 == 1 {
-                self.aba_prepare_proof_cache.insert(proof.epoch, proof);
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn process_val_phase_1(&mut self, proof: ABAProof) -> ConsensusResult<()> {
-        if self.aba_input_val[&proof.round] == proof.val {
-            return Ok(());
-        }
-        let aba_val = ABAVal::new(
-            self.name,
-            proof.epoch,
-            proof.round,
-            proof.val,
-            proof.phase,
-            self.signature_service.clone(),
-        ).await;
-        // only broadcast once
-        if !self.val_value_broadcasted {
-            self.val_value_broadcasted = true;
-            let message = ConsensusMessage::ABAVal(aba_val.clone());
-            Synchronizer::transmit(
-                message,
-                &self.name,
-                None,
-                &self.network_filter_smvba,
-                &self.committee,
-                TCVBA,
-            ).await?;
-            self.handle_aba_val(aba_val).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn process_val_phase_2(&mut self, proof: ABAProof) -> ConsensusResult<()> {
-        // only broadcast first value
-        if !self.bin_values.is_empty() {
-            let aba_val = ABAVal::new(
-                self.name,
-                proof.epoch,
-                proof.round,
-                proof.val,
-                AUX_PHASE,
-                self.signature_service.clone(),
-            ).await;
-            // only broadcast once
-            if !self.aux_value_broadcasted {
-                self.aux_value_broadcasted = true;
-                let message = ConsensusMessage::ABAVal(aba_val.clone());
+        for digest in digests {
+            let block = match self.dag.get(&digest) {
+                Some(block) => Some(block.clone()),
+                None => match self.store.read(digest.to_vec()).await? {
+                    Some(bytes) => Some(bincode::deserialize(&bytes)?),
+                    None => None,
+                },
+            };
+            if let Some(block) = block {
+                let message = ConsensusMessage::SyncReply(block);
                 Synchronizer::transmit(
                     message,
                     &self.name,
-                    None,
-                    &self.network_filter_smvba,
+                    Some(&sender),
+                    &self.network_filter,
                     &self.committee,
-                    TCVBA,
-                ).await?;
-                self.handle_aba_val(aba_val).await?;
+                    BLOCK_CHANNEL,
+                )
+                .await?;
             }
         }
-        self.bin_values.insert(proof.val);
-        Ok(())
-    }
-
-    pub async fn process_prepare_phase(&mut self, proof: ABAProof) -> ConsensusResult<()> {
-        let message = ConsensusMessage::ABAProof(proof.clone());
-        Synchronizer::transmit(
-            message,
-            &self.name,
-            None,
-            &self.network_filter_smvba,
-            &self.committee,
-            TCVBA,
-        ).await?;
-        self.handle_aba_proof(proof).await?; 
-        Ok(())
-    }
-
-    pub async fn handle_aux_phase(&mut self, aba_val: ABAVal) -> ConsensusResult<()> {
-        aba_val.verify()?;
-        *self.aux_value_nums
-            .entry((aba_val.epoch, aba_val.round))
-            .or_insert(0) += 1;
-        if let Some(aba_proof) = self.aggregator.add_aba_val(aba_val.clone())? {
-            debug!("Assembled {:?}", aba_proof);
-            self.aba_aux_phase_cache.insert((aba_proof.epoch, aba_proof.round), aba_proof);
-        }
-        Ok(())
-    }
-
-    pub async fn process_aux_phase(&mut self, epoch: SeqNumber, round: SeqNumber) -> ConsensusResult<()> {
-        let share = RandomnessShare::new(
-            epoch,
-            round,
-            self.name,
-            self.signature_service.clone(),
-        ).await;
-        if !self.coin_share_broadcasted {
-            self.coin_share_broadcasted = true;
-            let message = ConsensusMessage::ABACoinShare(share.clone());
-            Synchronizer::transmit(
-                message,
-                &self.name,
-                None,
-                &self.network_filter_smvba,
-                &self.committee,
-                TCVBA,
-            ).await?;
-            self.handle_coin_share(share).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn handle_coin_share(&mut self, share: RandomnessShare) -> ConsensusResult<()> {
-        if self.is_expired_aba_message(share.epoch, share.round) {
-            return Ok(());
-        }
-
-        share.verify(&self.committee, &self.pk_set)?;
-
-        if let Some(coin) = self.aggregator.add_aba_random(share.clone(), &self.pk_set)? {
-            debug!("Assembled coin {}", coin);
-            self.aba_coin_cache.insert((share.epoch, share.round), coin);
-        }
-        Ok(())
-    }
-
-    pub async fn advance_aba_round(&mut self, input_val: u64) -> ConsensusResult<()> {
-        self.aba_round += 1;
-        debug!("Moved to aba round {}", self.aba_round);
-        self.phase = VAL_PHASE;
-        self.aba_input_val.insert(self.aba_round, input_val);
-        let aba_val = ABAVal::new(
-            self.name,
-            self.epoch,
-            self.aba_round,
-            input_val,
-            VAL_PHASE,
-            self.signature_service.clone(),
-        ).await;
-        // Clear round based data structures
-        // Aggregator will be cleared later
-        let current_epoch = self.epoch;
-        let current_aba = self.aba_round;
-        self.val_value_broadcasted = false;
-        self.aux_value_broadcasted = false;
-        self.coin_share_broadcasted = false;
-        self.aux_proof_broadcasted = false;
-        self.bin_values.clear();
-        self.aba_val_phase_cache1.retain(|(k1, k2), _| k1 > &current_epoch || (k1 == &current_epoch && k2 >= &current_aba));
-        self.aba_val_phase_cache2.retain(|(k1, k2), _| k1 > &current_epoch || (k1 == &current_epoch && k2 >= &current_aba));
-        self.aba_aux_phase_cache.retain(|(k1, k2), _| k1 > &current_epoch || (k1 == &current_epoch && k2 >= &current_aba));
-        // self.aba_coin_cache.retain(|(k1, k2), _| k1 == &current_epoch && k2 >= &current_aba); // coin is used for multiple rounds
-        self.aux_value_nums.retain(|(k1, k2), _| k1 > &current_epoch || (k1 == &current_epoch && k2 >= &current_aba));
-        
-        let message = ConsensusMessage::ABAVal(aba_val.clone());
-        Synchronizer::transmit(
-            message,
-            &self.name,
-            None,
-            &self.network_filter_smvba,
-            &self.committee,
-            TCVBA,
-        ).await?;
-        self.handle_aba_val(aba_val).await?;
-
-        Ok(())
-    }
-
-    pub async fn process_coin_share(&mut self, epoch: SeqNumber, round: SeqNumber, coin: usize) -> ConsensusResult<()> {
-        if self.bin_values.len() == 1 {
-            let v = *self.bin_values.iter().next().unwrap();
-            if v % 2 == coin as u64 {
-                self.aba_output_val = Some(v);
-                // aux proof must be Some
-                let proof = self.aba_aux_phase_cache.get(&(epoch, round)).unwrap();
-                if !self.aux_proof_broadcasted {
-                    self.aux_proof_broadcasted = true;
-                    // No need to handle ourself.
-                    let message = ConsensusMessage::ABAProof(proof.clone());
-                    Synchronizer::transmit(
-                        message,
-                        &self.name,
-                        None,
-                        &self.network_filter_smvba,
-                        &self.committee,
-                        TCVBA,
-                    ).await?;
-                }
-                return Ok(());
-            }
-            self.advance_aba_round(v).await?;
-        } else {
-            if let Some(proof) = self.aba_aux_phase_cache.get(&(epoch, round)) {
-                let v= proof.val;
-                if v % 2 == coin as u64 {
-                    self.aba_output_val = Some(v);
-                    // aux proof must be Some
-                    // let proof = self.aba_aux_phase_cache.get(&(epoch, round)).unwrap();
-                    if !self.aux_proof_broadcasted {
-                        self.aux_proof_broadcasted = true;
-                        let message = ConsensusMessage::ABAProof(proof.clone());
-                        Synchronizer::transmit(
-                            message,
-                            &self.name,
-                            None,
-                            &self.network_filter_smvba,
-                            &self.committee,
-                            TCVBA,
-                        ).await?;
-                    }
-                    return Ok(());
-                }
-            }
-            // advance aba round
-            let val = *self.bin_values.iter().find(|&&value| value % 2 == coin as u64).unwrap();
-            self.advance_aba_round(val).await?;
-        }
-        
-        Ok(())
-    }
-
-    pub async fn handle_aba_val(&mut self, aba_val: ABAVal) -> ConsensusResult<()> {
-        if self.is_expired_aba_message(aba_val.epoch, aba_val.round) {
-            return Ok(());
-        }
-
-        let phase = aba_val.phase;
-        match phase {
-            PREPARE_PHASE => {
-                self.handle_prepare_phase(aba_val.clone()).await?;
-            },  
-            VAL_PHASE => {
-                self.handle_val_phase(aba_val.clone()).await?;
-            },
-            AUX_PHASE => {
-                self.handle_aux_phase(aba_val.clone()).await?;
-            },
-            _ => return Err(ConsensusError::InvalidPhase(phase))
-        }
-        Ok(())
-    }
-
-    pub async fn handle_aba_proof(&mut self, proof: ABAProof) -> ConsensusResult<()> {
-        if proof.epoch < self.epoch {
-            return Ok(());
-        }
-
-        proof.verify(&self.committee)?; 
-        
-        if proof.phase == PREPARE_PHASE {
-            self.aba_prepare_proof_cache.insert(proof.epoch, proof);
-            return Ok(());
-        }
-
-        // Process later, need coin.
-        if proof.val % 2 == 0 {
-            self.aba_help_proof0_cache.insert(proof.epoch, proof);
-        } else {
-            self.aba_help_proof1_cache.insert(proof.epoch, proof);
-        }
-        Ok(())
-    }
-
-    pub async fn process_aba_proof(&mut self, proof: ABAProof) -> ConsensusResult<()> {
-        if proof.phase == PREPARE_PHASE {
-            self.aba_output_val = Some(proof.val);
-            return Ok(());
-        }
-        // We must have coin.
-        if let Some(coin) = self.aba_coin_cache.get(&(proof.epoch, proof.round)) {
-            if proof.val % 2 == *coin as u64 {
-                self.aba_output_val = Some(proof.val);
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn process_aba_phase(&mut self) -> ConsensusResult<()> {
-        // Always true, only process tc once.
-        if self.phase >= INIT_PHASE && !self.tc_processed {
-            if let Some(tc) = self.tc_cache.get(&self.epoch) {
-                self.process_tc(tc.clone()).await?;
-                self.tc_processed = true;
-            }
-        }
-
-        if self.phase >= PREPARE_PHASE {
-            if let Some(proof) = self.aba_prepare_proof_cache.get(&self.epoch) {
-                self.process_prepare_phase(proof.clone()).await?;
-            } else if !self.prepare_proof_processed 
-                && self.aba_prepare_set.len() >= self.committee.quorum_threshold() as usize 
-            {
-                self.prepare_proof_processed = true;
-                let first_odd: Option<&u64> = self.aba_prepare_set.iter().find(|&&seq| seq % 2 == 1);
-                if let Some(val) = first_odd {
-                    self.aba_input_val.insert(1, *val);
-                } else {
-                    self.aba_input_val.insert(1, self.aba_prepare_set[0]);
-                }
-                let input_val = *self.aba_input_val.get(&1).unwrap();
-                let aba_val = ABAVal::new(
-                    self.name,
-                    self.epoch,
-                    1,
-                    input_val,
-                    VAL_PHASE,
-                    self.signature_service.clone(),
-                ).await;
-                let message = ConsensusMessage::ABAVal(aba_val.clone());
-                Synchronizer::transmit(
-                    message, 
-                    &self.name, 
-                    None, 
-                    &self.network_filter_smvba, 
-                    &self.committee,
-                    TCVBA,
-                ).await?;
-                self.handle_aba_val(aba_val).await?;
-            }
-        } 
-
-        if self.phase >= VAL_PHASE {
-            if let Some(proof) = self.aba_val_phase_cache1.get(&(self.epoch, self.aba_round)) {
-                self.process_val_phase_1(proof.clone()).await?;
-            }
-            if let Some(proof) = self.aba_val_phase_cache2.get(&(self.epoch, self.aba_round)) {
-                self.process_val_phase_2(proof.clone()).await?;
-            }
-        }
-
-        if self.phase >= AUX_PHASE {
-            if *self.aux_value_nums
-                .entry((self.epoch, self.aba_round))
-                .or_insert(0) >= self.committee.quorum_threshold() as u64
-            && (self.bin_values.len() == 2 || self.aba_aux_phase_cache
-                .contains_key(&(self.epoch, self.aba_round)))
-            {
-                self.process_aux_phase(self.epoch, self.aba_round).await?;
-            }
-        }
-
-        if self.phase == COIN_PHASE {
-            // Ensure we have coin, proof verification needs coin.
-            if self.aba_round == 1 && !self.aba_coin_cache.contains_key(&(self.epoch, self.aba_round)) {
-                self.aba_coin_cache.insert((self.epoch, self.aba_round), 0);
-            } 
-            if let Some(coin) = self.aba_coin_cache.get(&(self.epoch, self.aba_round)) {
-                self.process_coin_share(self.epoch, self.aba_round, *coin).await?;
-            }
-        }
-
-        // We can process HELP_PHASE if we are changing view.
-        if self.is_view_change {
-            if let Some(proof) = self.aba_prepare_proof_cache.get(&self.epoch) {
-                debug!("fast pace!");
-                self.process_aba_proof(proof.clone()).await?;
-            } else if let Some(proof) = self.aba_help_proof0_cache.get(&self.epoch) {
-                self.process_aba_proof(proof.clone()).await?;
-            } else if let Some(proof) = self.aba_help_proof1_cache.get(&self.epoch) {
-                self.process_aba_proof(proof.clone()).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn update_aba_phase(&mut self, chain: &mut Chain) -> ConsensusResult<()> {
-        // If we are not changing view, return.
-        if !self.is_view_change {
-            return Ok(());
-        }
-
-        debug!("Current phase: {}, bin_value empty: {}", self.phase, self.bin_values.is_empty());
-        // Only first aba round.
-        if self.phase == INIT_PHASE && self.tc_processed {
-            debug!("Epoch {}, enter PREPARE_PHASE", self.epoch);
-            self.phase = PREPARE_PHASE;
-        }
-
-        if self.phase == PREPARE_PHASE && self.prepare_proof_processed {
-            debug!("Epoch {}, enter VAL_PHASE", self.epoch);
-            self.phase = VAL_PHASE;
-        }
-
-        if self.phase == VAL_PHASE && !self.bin_values.is_empty() {
-            debug!("Epoch {}, enter AUX_PHASE", self.epoch);
-            self.phase = AUX_PHASE;
-        }
-
-        if self.phase == AUX_PHASE 
-            && self.aba_coin_cache.contains_key(&(self.epoch, self.aba_round)) 
-            && *self.aux_value_nums
-                .entry((self.epoch, self.aba_round))
-                .or_insert(0) >= self.committee.quorum_threshold() as u64
-            && (self.bin_values.len() == 2 || self.aba_aux_phase_cache
-                .contains_key(&(self.epoch, self.aba_round)))
-        {
-            debug!("Epoch {}, enter COIN_PHASE", self.epoch);
-            self.phase = COIN_PHASE;
-        }
-
-        if self.aba_output_val.is_some() {
-            debug!("Epoch {}, enter OUTPUT_PHASE", self.epoch);
-            // prepare block
-            let output_height = self.aba_output_val.unwrap();
-            debug!("output_height: {}", output_height);
-            if !chain.height_to_digest.contains_key(&output_height) {
-                debug!("No such height!");
-                return Ok(());
-            }  
-            let digest = chain.height_to_digest.get(&output_height).unwrap();     
-            let block= self.synchronizer.get_block(
-                self.name, 
-                digest,
-                None
-            ).await?;
-            if block.is_none() {
-                debug!("No such block, chain {}, height {}", chain.name, output_height);
-                return Ok(());
-            }
-            // commit block 
-            let to_commit_block = block.unwrap();
-            self.update_last_pending_height(&to_commit_block, chain);
-            self.commit(to_commit_block, chain).await?;
-            debug!("aba status end, epoch {}", self.epoch);
-            // advance epoch
-            self.epoch += 1;
-            debug!("advance epoch, epoch: {}", self.epoch);
-            // reset previous leader chain
-            chain.height_to_digest.retain(|k, _| k > &output_height);
-            chain.epoch += 1;
-            chain.height = output_height + NEXT_EPOCH_HEIGHT;
-            chain.last_committed_height = chain.height;
-            chain.last_pending_height = chain.height;
-            // clean all data structure, only base epoch
-            let current_epoch = self.epoch;
-            self.is_view_change = false;
-            self.tc_processed = false;
-            self.prepare_proof_processed = false;
-            self.val_value_broadcasted = false;
-            self.aux_value_broadcasted = false;
-            self.coin_share_broadcasted = false;
-            self.aux_proof_broadcasted = false;
-            self.aggregator.cleanup_aba(&self.epoch);
-            self.bin_values.clear();
-            self.aba_round = 1;
-            self.phase = INIT_PHASE;
-            self.aba_output_val = None;
-            self.aba_prepare_set.clear();
-            self.aba_input_val.clear();
-            self.tc_cache.retain(|k, _| k >= &current_epoch);
-            self.aba_help_proof0_cache.retain(|k, _| k >= &current_epoch);
-            self.aba_help_proof1_cache.retain(|k, _| k >= &current_epoch);
-            self.aba_prepare_proof_cache.retain(|k, _| k >= &current_epoch);
-            self.aba_val_phase_cache1.retain(|(k, _), _| k >= &current_epoch);
-            self.aba_val_phase_cache2.retain(|(k, _), _| k >= &current_epoch);
-            self.aba_aux_phase_cache.retain(|(k, _), _| k >= &current_epoch);
-            self.aba_coin_cache.retain(|(k, _), _| k >= &current_epoch);
-            self.aux_value_nums.retain(|(k, _), _| k >= &current_epoch);
-            // Broadcast new block.
-            if chain.name == self.name {
-                let block = self.generate_proposal(&chain, true).await;
-                self.broadcast_propose(block, chain).await?; 
-            }
-        } else {
-            self.process_aba_phase().await?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn commit_next_chain(&mut self, next_chain: &mut Chain) -> ConsensusResult<()> {
-        // Commit next chain.
-        let next_digest = next_chain.height_to_digest.get(&next_chain.height).unwrap();     
-        let next_block= self.synchronizer.get_block(
-            self.name, 
-            next_digest,
-            None
-        ).await?;
-        if next_block.is_none() {
-            debug!("No such block, chain {}, height {}", next_chain.name, next_chain.height);
-            return Ok(());
-        }
-        let to_commit_block = next_block.unwrap();
-        self.process_block(&to_commit_block, next_chain).await?;
         Ok(())
     }
 
     pub async fn run(&mut self) {
-        // Propose the first block for the chain led by us.
-        let mut chain = self.pubkey_to_chain.get(&self.name).cloned().unwrap();
-        let block = self.generate_proposal(&chain, false).await;
-        let _ = self.broadcast_propose(block, &mut chain).await;
-        self.pubkey_to_chain.insert(self.name, chain);
-        
+        let accuracy = min(self.parameters.sync_retry_delay, 1_000).max(1);
+        let mut sync_timer = interval(Duration::from_millis(accuracy));
+
+        // Propose the first block.
+        if let Err(e) = self.try_advance().await {
+            warn!("{}", e);
+        }
+
         loop {
-            self.total_epoch += 1;
-            debug!("Epoch {}, leader: {}", self.total_epoch, self.leader_elector.get_leader(self.epoch));
+            let deadline = self.proposal_deadline;
             let result = tokio::select! {
                 Some(message) = self.core_channel.recv() => {
                     match message {
-                        ConsensusMessage::Propose(block) => {
-                            debug!("receive propose from {}, height {}", block.author, block.height);
-                            let mut chain = self.pubkey_to_chain.get(&block.author).cloned().unwrap();
-                            let result = self.handle_proposal(&block, &mut chain).await;
-                            self.pubkey_to_chain.insert(block.author, chain);
-                            let leader = self.leader_elector.get_leader(self.epoch);
-                            let mut chain = self.pubkey_to_chain.get(&leader).cloned().unwrap(); // should be leader not self
-                            let _ = self.check_timeout(&mut chain).await;            
-                            self.pubkey_to_chain.insert(leader, chain);
-                            result
-                        },
-                        ConsensusMessage::Vote(vote) => {
-                            debug!("receive vote from {}", vote.author);
-                            let mut chain = self.pubkey_to_chain.get(&vote.proposer).cloned().unwrap(); // Use proposer instead of author.
-                            let result = self.handle_vote(&vote, &mut chain).await;
-                            self.pubkey_to_chain.insert(vote.proposer, chain);
-                            result
-                        },
-                        ConsensusMessage::LoopBack(block) => {
-                            debug!("Epoch: {}, receive loopback block from {}", self.total_epoch, block.author);
-                            let mut chain = self.pubkey_to_chain.get(&block.author).cloned().unwrap();
-                            let result = self.process_block(&block, &mut chain).await;
-                            self.pubkey_to_chain.insert(block.author, chain);
-                            result
-                        },                        
-                        ConsensusMessage::SyncRequest(digest, sender) => {
-                            debug!("receive sync request {} from {}", digest, sender);
-                            let result = self.handle_sync_request(digest, sender).await;
-                            result
-                        },
-                        ConsensusMessage::SyncReply(block) => {
-                            debug!("receive sync reply from {}", block.author);
-                            let mut chain = self.pubkey_to_chain.get(&block.author).cloned().unwrap();
-                            let result = self.handle_proposal(&block, &mut chain).await;
-                            self.pubkey_to_chain.insert(block.author, chain);
-                            result
-                        },
-                        _ => panic!("Unexpected protocol message")
+                        ConsensusMessage::Propose(block) => self.handle_proposal(block).await,
+                        ConsensusMessage::SyncReply(block) => self.handle_proposal(block).await,
+                        ConsensusMessage::LoopBack(block) => self.process_block(block.digest(), block).await,
+                        ConsensusMessage::SyncRequest(digests, sender) => self.handle_sync_request(digests, sender).await,
+                        message => {
+                            warn!("Unexpected message on the block channel: {:?}", message);
+                            Ok(())
+                        }
                     }
                 },
-                Some(message) = self.smvba_channel.recv() => {
+                Some(message) = self.fast_channel.recv() => {
                     match message {
-                        ConsensusMessage::Timeout(timeout) => {
-                            debug!("receive timeout from {}, epoch {}", timeout.author, timeout.epoch);
-                            let leader = self.leader_elector.get_leader(timeout.epoch);
-                            let mut chain = self.pubkey_to_chain.get(&leader).cloned().unwrap();
-                            let result = self.handle_timeout(&timeout, &mut chain).await;
-                            self.pubkey_to_chain.insert(leader, chain);
-                            result
-                        },
-                        ConsensusMessage::TC(tc) => {
-                            debug!("receive tc, epoch {}", tc.epoch);
-                            let result = self.handle_tc(tc).await;
-                            let leader = self.leader_elector.get_leader(self.epoch);
-                            let mut chain = self.pubkey_to_chain.get(&leader).cloned().unwrap(); // should be leader not self
-                            let _ = self.check_timeout(&mut chain).await;            
-                            self.pubkey_to_chain.insert(leader, chain);
-                            result
-                        },
-                        ConsensusMessage::ABAVal(aba_val) => {
-                            debug!("receive aba_val from {}, epoch {}, round {}, phase {}, val {}", 
-                                aba_val.author, aba_val.epoch, aba_val.round, aba_val.phase, aba_val.val);
-                            let result = self.handle_aba_val(aba_val).await;
-                            result
-                        },
-                        ConsensusMessage::ABAProof(proof) => {
-                            debug!("receive aba_proof, epoch {}, round {}, val {}",
-                                proof.epoch, proof.round, proof.val);
-                            let result = self.handle_aba_proof(proof).await;
-                            result
-                        },
-                        ConsensusMessage::ABACoinShare(share) => {
-                            debug!("receive aba_coin_share from {}, epoch {}, round {}", share.author, share.epoch, share.round);
-                            let result = self.handle_coin_share(share).await;
-                            result
-                        },
-                        _ => panic!("Unexpected protocol message")
+                        ConsensusMessage::Vote(vote) => self.handle_vote(vote).await,
+                        ConsensusMessage::Certificate(certificate) => self.handle_certificate(certificate).await,
+                        message => {
+                            warn!("Unexpected message on the fast channel: {:?}", message);
+                            Ok(())
+                        }
                     }
+                },
+                _ = sync_timer.tick() => self.synchronizer.request_expired().await,
+                () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
+                    self.proposal_deadline = None;
+                    Ok(())
                 },
             };
-            match result {
-                Ok(()) => (),
-                Err(ConsensusError::StoreError(e)) => error!("{}", e),
-                Err(ConsensusError::SerializationError(e)) => error!("Store corrupted. {}", e),
-                Err(e) => warn!("{}", e),
-            }
-            let leader = self.leader_elector.get_leader(self.epoch);
-            let mut chain = self.pubkey_to_chain.get(&leader).cloned().unwrap(); 
-            let next_leader = self.leader_elector.get_leader(self.epoch + 1);
-            let _ = self.update_aba_phase(&mut chain).await;
-            self.pubkey_to_chain.insert(leader, chain);
-            
-            if self.leader_elector.get_leader(self.epoch) == next_leader {
-                let mut next_chain = self.pubkey_to_chain.get(&next_leader).cloned().unwrap(); 
-                let _ = self.commit_next_chain(&mut next_chain);
-                self.pubkey_to_chain.insert(next_leader, next_chain);
-            }
+            Self::log_error(result);
+
+            // Proposals are on the critical path, so advance before committing.
+            Self::log_error(self.try_advance().await);
+            Self::log_error(self.try_commit().await);
+        }
+    }
+
+    fn log_error(result: ConsensusResult<()>) {
+        match result {
+            Ok(()) => (),
+            Err(ConsensusError::StoreError(e)) => error!("{}", e),
+            Err(ConsensusError::SerializationError(e)) => error!("Store corrupted. {}", e),
+            Err(e) => warn!("{}", e),
         }
     }
 }

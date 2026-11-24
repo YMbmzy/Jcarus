@@ -1,24 +1,22 @@
 use crate::config::{Committee, Stake};
-use crate::core::{SeqNumber, VAL_PHASE};
+use crate::core::SeqNumber;
 use crate::error::{ConsensusError, ConsensusResult};
-use crate::messages::{ABAProof, ABAVal, RandomnessShare, Timeout, Vote, QC, TC};
+use crate::messages::{CoinShare, Vote, QC};
 use crypto::{PublicKey, Signature};
-use log::debug;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::TryInto;
 use threshold_crypto::PublicKeySet;
-// use std::convert::TryInto;
 
 #[cfg(test)]
 #[path = "tests/aggregator_tests.rs"]
 pub mod aggregator_tests;
 
-#[derive(Clone)]
 pub struct Aggregator {
     committee: Committee,
+    // Votes for our own blocks, keyed by round (we author one block per round).
     votes_aggregators: HashMap<SeqNumber, Box<QCMaker>>,
-    timeouts_aggregators: HashMap<SeqNumber, Box<TCMaker>>,
-    aba_vals_aggregators: HashMap<(SeqNumber, SeqNumber, u8, u64), Box<ABAProofMaker>>,
-    aba_randomcoin_aggregators: HashMap<(SeqNumber, SeqNumber), Box<ABARandomCoinMaker>>,
+    // Coin shares, keyed by wave.
+    coin_aggregators: HashMap<SeqNumber, Box<CoinMaker>>,
 }
 
 impl Aggregator {
@@ -26,16 +24,11 @@ impl Aggregator {
         Self {
             committee,
             votes_aggregators: HashMap::new(),
-            timeouts_aggregators: HashMap::new(),
-            aba_vals_aggregators: HashMap::new(),
-            aba_randomcoin_aggregators: HashMap::new(),
+            coin_aggregators: HashMap::new(),
         }
     }
 
     pub fn add_vote(&mut self, vote: Vote) -> ConsensusResult<Option<QC>> {
-        // TODO [issue #7]: A bad node may make us run out of memory by sending many votes
-        // with different round numbers or different digests.
-
         // Add the new vote to our aggregator and see if we have a QC.
         self.votes_aggregators
             .entry(vote.height)
@@ -43,47 +36,24 @@ impl Aggregator {
             .append(vote, &self.committee)
     }
 
-    pub fn add_timeout(&mut self, timeout: Timeout) -> ConsensusResult<Option<TC>> {
-        // TODO: A bad node may make us run out of memory by sending many timeouts
-        // with different round numbers.
-
-        // Add the new timeout to our aggregator and see if we have a TC.
-        self.timeouts_aggregators
-            .entry(timeout.epoch)
-            .or_insert_with(|| Box::new(TCMaker::new()))
-            .append(timeout, &self.committee)
-    }
-
-    pub fn add_aba_val(&mut self, aba_val: ABAVal) -> ConsensusResult<Option<ABAProof>> {
-        self.aba_vals_aggregators
-            .entry((aba_val.epoch, aba_val.round, aba_val.phase, aba_val.val))
-            .or_insert_with(|| Box::new(ABAProofMaker::new()))
-            .append(aba_val, &self.committee)
-    }
-
-    pub fn add_aba_random(
+    // Returns the coin value once f+1 shares of the wave are collected.
+    pub fn add_coin_share(
         &mut self,
-        share: RandomnessShare,
+        share: CoinShare,
         pk_set: &PublicKeySet,
     ) -> ConsensusResult<Option<usize>> {
-        self.aba_randomcoin_aggregators
-            .entry((share.epoch, share.round))
-            .or_insert_with(|| Box::new(ABARandomCoinMaker::new()))
+        self.coin_aggregators
+            .entry(share.wave)
+            .or_insert_with(|| Box::new(CoinMaker::new()))
             .append(share, &self.committee, pk_set)
     }
 
-    pub fn cleanup(&mut self, epoch: &SeqNumber, height: &SeqNumber) {
-        self.votes_aggregators.retain(|k, _| k >= height);
-        self.timeouts_aggregators.retain(|k, _| k >= epoch);
-    }
-
-    pub fn cleanup_aba(&mut self, epoch: &SeqNumber) {
-        self.aba_vals_aggregators.retain(|(k, _, _, _), _| k >= epoch);
-        self.aba_randomcoin_aggregators.retain(|(k, _), _| k >= epoch);
+    pub fn cleanup(&mut self, gc_round: SeqNumber, gc_wave: SeqNumber) {
+        self.votes_aggregators.retain(|k, _| k >= &gc_round);
+        self.coin_aggregators.retain(|k, _| k >= &gc_wave);
     }
 }
 
-#[derive(Clone)]
 struct QCMaker {
     weight: Stake,
     votes: Vec<(PublicKey, Signature)>,
@@ -109,13 +79,13 @@ impl QCMaker {
             ConsensusError::AuthorityReuseinQC(author)
         );
 
-        self.votes.push((author, vote.clone().signature));
+        self.votes.push((author, vote.signature));
         self.weight += committee.stake(&author);
 
         if self.weight >= committee.quorum_threshold() {
             self.weight = 0; // Ensures QC is only made once.
             return Ok(Some(QC {
-                hash: vote.hash.clone(),
+                hash: vote.hash,
                 epoch: vote.epoch,
                 height: vote.height,
                 proposer: vote.proposer,
@@ -126,154 +96,48 @@ impl QCMaker {
     }
 }
 
-#[derive(Clone)]
-struct TCMaker {
+struct CoinMaker {
     weight: Stake,
-    votes: Vec<(PublicKey, Signature, SeqNumber)>,
+    shares: BTreeMap<usize, threshold_crypto::SignatureShare>,
     used: HashSet<PublicKey>,
 }
 
-impl TCMaker {
+impl CoinMaker {
     pub fn new() -> Self {
         Self {
             weight: 0,
-            votes: Vec::new(),
+            shares: BTreeMap::new(),
             used: HashSet::new(),
         }
     }
 
-    /// Try to append a signature to a (partial) quorum.
+    /// Try to append a share to a (partial) set of f+1 shares.
     pub fn append(
         &mut self,
-        timeout: Timeout,
-        committee: &Committee,
-    ) -> ConsensusResult<Option<TC>> {
-        let author = timeout.author;
-
-        // Ensure it is the first time this authority votes.
-        ensure!(
-            self.used.insert(author),
-            ConsensusError::AuthorityReuseinTC(author)
-        );
-
-        // Add the timeout to the accumulator.
-        self.votes
-            .push((author, timeout.signature, timeout.high_qc.height));
-        self.weight += committee.stake(&author);
-
-        if self.weight >= committee.quorum_threshold() {
-            self.weight = 0; // Ensures TC is only created once.
-            return Ok(Some(TC {
-                epoch: timeout.epoch,
-                votes: self.votes.clone(),
-            }));
-        }
-        Ok(None)
-    }
-}
-
-#[derive(Clone)]
-struct ABAProofMaker {
-    weight: Stake,
-    votes: Vec<(PublicKey, Signature)>,
-    used: HashSet<PublicKey>,
-}
-
-impl ABAProofMaker {
-    pub fn new() -> Self {
-        Self {
-            weight: 0,
-            votes: Vec::new(),
-            used: HashSet::new(),
-        }
-    }
-
-    /// Try to append a signature to a (partial) quorum.
-    pub fn append(&mut self, aba_val: ABAVal, committee: &Committee) -> ConsensusResult<Option<ABAProof>> {
-        let author = aba_val.author;
-
-        // Ensure it is the first time this authority votes.
-        ensure!(
-            self.used.insert(author),
-            ConsensusError::AuthorityReuseinABA(author, aba_val.phase)
-        );
-
-        self.votes.push((author, aba_val.signature));
-        self.weight += committee.stake(&author);
-        debug!("phase: {}, weight: {}", aba_val.phase, self.weight);
-
-        if self.weight == committee.random_coin_threshold() && aba_val.phase == VAL_PHASE {
-            return Ok(Some(ABAProof {
-                epoch: aba_val.epoch,
-                round: aba_val.round,
-                val: aba_val.val,
-                phase: aba_val.phase,
-                votes: self.votes.clone(),
-                tag: true,
-            }));
-        }
-
-        if self.weight == committee.quorum_threshold() {
-            return Ok(Some(ABAProof {
-                epoch: aba_val.epoch,
-                round: aba_val.round,
-                val: aba_val.val,
-                phase: aba_val.phase,
-                votes: self.votes.clone(),
-                tag: false,
-            }));
-        }
-
-        Ok(None)
-    }
-}
-
-#[derive(Clone)]
-struct ABARandomCoinMaker {
-    weight: Stake,
-    shares: Vec<RandomnessShare>,
-    used: HashSet<PublicKey>,
-}
-
-impl ABARandomCoinMaker {
-    pub fn new() -> Self {
-        Self {
-            weight: 0,
-            shares: Vec::new(),
-            used: HashSet::new(),
-        }
-    }
-
-    /// Try to append a signature to a (partial) quorum.
-    pub fn append(
-        &mut self,
-        share: RandomnessShare,
+        share: CoinShare,
         committee: &Committee,
         pk_set: &PublicKeySet,
     ) -> ConsensusResult<Option<usize>> {
         let author = share.author;
-        // Ensure it is the first time this authority votes.
+
+        // Ensure it is the first time this authority sends its share.
         ensure!(
             self.used.insert(author),
             ConsensusError::AuthorityReuseinCoin(author)
         );
-        self.shares.push(share.clone());
-        self.weight += committee.stake(&author);
-        if self.weight == committee.random_coin_threshold() {
-            // self.weight = 0; // Ensures QC is only made once.
-            let mut sigs = BTreeMap::new();
-            // Check the random shares.
-            for share in self.shares.clone() {
-                sigs.insert(
-                    committee.id(share.author.clone()),
-                    share.signature_share.clone(),
-                );
-            }
-            if let Ok(sig) = pk_set.combine_signatures(sigs.iter()) {
-                let id = usize::from_be_bytes((&sig.to_bytes()[0..8]).try_into().unwrap()) % 2;
 
-                return Ok(Some(id));
-            }
+        self.shares.insert(committee.id(author), share.share);
+        self.weight += committee.stake(&author);
+
+        // Combine exactly once, when the threshold is reached.
+        if self.weight >= committee.random_coin_threshold()
+            && self.weight - committee.stake(&author) < committee.random_coin_threshold()
+        {
+            let sig = pk_set
+                .combine_signatures(self.shares.iter())
+                .map_err(|_| ConsensusError::RandomCoinWithWrongShares)?;
+            let coin = u64::from_be_bytes(sig.to_bytes()[0..8].try_into().unwrap());
+            return Ok(Some(coin as usize));
         }
         Ok(None)
     }

@@ -1,5 +1,5 @@
 use crate::config::Committee;
-use crate::core::{SeqNumber};
+use crate::core::SeqNumber;
 use crate::error::{ConsensusError, ConsensusResult};
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
 use ed25519_dalek::Digest as _;
@@ -14,10 +14,33 @@ use threshold_crypto::{PublicKeySet, SignatureShare};
 #[path = "tests/messages_tests.rs"]
 pub mod messages_tests;
 
-// daniel: Add view, height, fallback in Block, Vote and QC
+// Each wave consists of three rounds: r1 (PB), r2 (CBC) and r3 (BBC).
+pub const ROUNDS_PER_WAVE: SeqNumber = 3;
+pub const R1: u8 = 1;
+pub const R2: u8 = 2;
+pub const R3: u8 = 3;
+
+// Global rounds start at 1: round = 3 * (wave - 1) + phase.
+pub fn wave_of(round: SeqNumber) -> SeqNumber {
+    (round + ROUNDS_PER_WAVE - 1) / ROUNDS_PER_WAVE
+}
+
+pub fn phase_of(round: SeqNumber) -> u8 {
+    ((round - 1) % ROUNDS_PER_WAVE + 1) as u8
+}
+
+pub fn round_of(wave: SeqNumber, phase: u8) -> SeqNumber {
+    ROUNDS_PER_WAVE * (wave - 1) + phase as SeqNumber
+}
+
+// The field layout is shared with the mempool crate, so the names are kept:
+// `height` is the global round, `epoch` is the wave and `total_epoch` is unused.
+// `qc` is the QC1 of the author's own r1 block (r2 blocks only, genesis otherwise).
+// `references` holds (author, digest, round): strong references point to round
+// `height - 1`, weak references to rounds `<= height - 2`.
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Block {
-    pub qc: QC, 
+    pub qc: QC,
     pub author: PublicKey,
     pub height: SeqNumber,
     pub epoch: SeqNumber,
@@ -32,8 +55,6 @@ impl Block {
         qc: QC,
         author: PublicKey,
         height: SeqNumber,
-        epoch: SeqNumber,
-        total_epoch: SeqNumber,
         payload: Vec<Digest>,
         references: Vec<(PublicKey, Digest, SeqNumber)>,
         mut signature_service: SignatureService,
@@ -42,8 +63,8 @@ impl Block {
             qc,
             author,
             height,
-            epoch,
-            total_epoch,
+            epoch: wave_of(height),
+            total_epoch: 0,
             payload,
             references,
             signature: Signature::default(),
@@ -57,8 +78,20 @@ impl Block {
         Block::default()
     }
 
-    pub fn parent(&self) -> &Digest {
-        &self.qc.hash
+    pub fn wave(&self) -> SeqNumber {
+        wave_of(self.height)
+    }
+
+    pub fn phase(&self) -> u8 {
+        phase_of(self.height)
+    }
+
+    pub fn strong_references(&self) -> impl Iterator<Item = &Digest> {
+        let parent_round = self.height.saturating_sub(1);
+        self.references
+            .iter()
+            .filter(move |(_, _, round)| *round == parent_round)
+            .map(|(_, digest, _)| digest)
     }
 
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
@@ -72,8 +105,8 @@ impl Block {
         // Check the signature.
         self.signature.verify(&self.digest(), &self.author)?;
 
-        // Check the embedded QC.
-        if self.qc != QC::genesis() {
+        // Check the embedded QC1.
+        if self.phase() == R2 {
             self.qc.verify(committee)?;
         }
 
@@ -94,6 +127,7 @@ impl Hash for Block {
         for x in &self.references {
             hasher.update(&x.0);
             hasher.update(&x.1.0);
+            hasher.update(x.2.to_le_bytes());
         }
         hasher.update(&self.qc.hash.0);
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
@@ -104,7 +138,7 @@ impl fmt::Debug for Block {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B(author {}, height {}, epoch {}, qc {:?}, payload_len {}, references_len {})",
+            "{}: B(author {}, round {}, wave {}, qc {:?}, payload_len {}, references_len {})",
             self.digest(),
             self.author,
             self.height,
@@ -134,12 +168,13 @@ pub struct Vote {
 
 impl Vote {
     pub async fn new(
+        hash: Digest,
         block: &Block,
         author: PublicKey,
         mut signature_service: SignatureService,
     ) -> Self {
         let vote = Self {
-            hash: block.digest(),
+            hash,
             epoch: block.epoch,
             height: block.height,
             author,
@@ -178,7 +213,7 @@ impl fmt::Debug for Vote {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "Vote(blockhash {}, proposer {}, height {}, epoch {}, voter {})",
+            "Vote(blockhash {}, proposer {}, round {}, wave {}, voter {})",
             self.hash, self.proposer, self.height, self.epoch, self.author
         )
     }
@@ -190,6 +225,7 @@ impl fmt::Display for Vote {
     }
 }
 
+// QC1 certifies an r1 block (PB), QC2 certifies an r2 block (CBC).
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct QC {
     pub hash: Digest,
@@ -204,14 +240,10 @@ impl QC {
         QC::default()
     }
 
-    pub fn timeout(&self) -> bool {
-        self.hash == Digest::default() && self.height != 0
-    }
-
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         // Ensure the QC has a quorum.
-        let mut weight = 0; //票数
-        let mut used = HashSet::new(); //防止重复统计
+        let mut weight = 0;
+        let mut used = HashSet::new();
         for (name, _) in self.votes.iter() {
             ensure!(
                 !used.contains(name),
@@ -247,7 +279,7 @@ impl fmt::Debug for QC {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "QC(hash {}, epoch {}, height {})",
+            "QC(hash {}, wave {}, round {})",
             self.hash, self.epoch, self.height
         )
     }
@@ -259,255 +291,36 @@ impl PartialEq for QC {
     }
 }
 
+// Threshold coin share of a wave; f+1 shares reveal the wave leader.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Timeout {
-    pub high_qc: QC,
-    pub epoch: SeqNumber,
+pub struct CoinShare {
+    pub wave: SeqNumber,
     pub author: PublicKey,
-    pub signature: Signature,
+    pub share: SignatureShare,
 }
 
-impl Timeout {
+impl CoinShare {
     pub async fn new(
-        high_qc: QC,
-        epoch: SeqNumber,
+        wave: SeqNumber,
         author: PublicKey,
         mut signature_service: SignatureService,
     ) -> Self {
-        let timeout = Self {
-            high_qc,
-            epoch,
-            author,
-            signature: Signature::default(),
-        };
-        let signature = signature_service.request_signature(timeout.digest()).await;
-        Self {
-            signature,
-            ..timeout
-        }
-    }
-
-    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
-        // Ensure the authority has voting rights.
-        ensure!(
-            committee.stake(&self.author) > 0,
-            ConsensusError::UnknownAuthority(self.author)
-        );
-
-        // Check the signature.
-        self.signature.verify(&self.digest(), &self.author)?;
-
-        // Check the embedded QC.
-        if self.high_qc != QC::genesis() {
-            self.high_qc.verify(committee)?;
-        }
-        Ok(())
-    }
-}
-
-impl Hash for Timeout {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.high_qc.height.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for Timeout {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "TV(author {}, epoch {}, high_qc {:?})", self.author, self.epoch, self.high_qc)
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TC {
-    pub epoch: SeqNumber,
-    pub votes: Vec<(PublicKey, Signature, SeqNumber)>,
-}
-
-impl TC {
-    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
-        // Ensure the QC has a quorum.
-        let mut weight = 0;
-        let mut used = HashSet::new();
-        for (name, _, _) in self.votes.iter() {
-            ensure!(!used.contains(name), ConsensusError::AuthorityReuseinTC(*name));
-            let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, ConsensusError::UnknownAuthority(*name));
-            used.insert(*name);
-            weight += voting_rights;
-        }
-        ensure!(
-            weight >= committee.quorum_threshold(),
-            ConsensusError::TCRequiresQuorum
-        );
-
-        // Check the signatures.
-        for (author, signature, high_qc_round) in &self.votes {
-            let mut hasher = Sha512::new();
-            hasher.update(self.epoch.to_le_bytes());
-            hasher.update(high_qc_round.to_le_bytes());
-            let digest = Digest(hasher.finalize().as_slice()[..32].try_into().unwrap());
-            signature.verify(&digest, author)?;
-        }
-        Ok(())
-    }
-
-    pub fn high_qc_rounds(&self) -> Vec<SeqNumber> {
-        self.votes.iter().map(|(_, _, r)| r).cloned().collect()
-    }
-}
-
-impl fmt::Debug for TC {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "TC(epoch {}, high_qc_rounds {:?})", self.epoch, self.high_qc_rounds())
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ABAVal {
-    pub author: PublicKey,
-    pub epoch: SeqNumber,
-    pub round: SeqNumber,
-    pub phase: u8,
-    pub val: u64,
-    pub signature: Signature,
-}
-
-impl ABAVal {
-    pub async fn new(
-        author: PublicKey,
-        epoch: SeqNumber,
-        round: SeqNumber, // ABA round
-        val: u64,
-        phase: u8,
-        mut signature_service: SignatureService,
-    ) -> Self {
-        let aba_val = Self {
-            author,
-            epoch,
-            round,
-            val,
-            phase,
-            signature: Signature::default(),
-        };
-        let signature= signature_service.request_signature(aba_val.digest()).await;
-        Self {
-            signature,
-            ..aba_val
-        }
-    }
-
-    pub fn verify(&self) -> ConsensusResult<()> {
-        self.signature.verify(&self.digest(), &self.author)?;
-        Ok(())
-    }
-}
-
-impl Hash for ABAVal {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.round.to_le_bytes());
-        hasher.update(self.val.to_le_bytes());
-        hasher.update(self.phase.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for ABAVal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ABAVal(epoch {}, round {}, phase {}, val {})",
-            self.epoch, self.round, self.phase, self.val
-        )
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ABAProof {
-    pub epoch: SeqNumber,
-    pub round: SeqNumber,
-    pub val: u64,
-    pub phase: u8,
-    pub votes: Vec<(PublicKey, Signature)>,
-    pub tag: bool, // tag is true if f+1
-}
-
-impl ABAProof {
-    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
-        let mut weight = 0;
-        let mut used = HashSet::new();
-        for (name, _) in self.votes.iter() {
-            ensure!(!used.contains(name), ConsensusError::AuthorityReuseinABA(*name, self.phase));
-            let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, ConsensusError::UnknownAuthority(*name));
-            used.insert(*name);
-            weight += voting_rights;
-        }
-        ensure!(
-            weight >= committee.quorum_threshold(),
-            ConsensusError::QCRequiresQuorum
-        );
-
-        // Check the signatures.
-        Signature::verify_batch(&self.digest(), &self.votes).map_err(ConsensusError::from)
-    }
-}
-
-impl Hash for ABAProof {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.round.to_le_bytes());
-        hasher.update(self.val.to_le_bytes());
-        hasher.update(self.phase.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for ABAProof {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f, 
-            "ABAProof(epoch {}, round {}, phase {}, val {})", 
-            self.epoch, self.round, self.phase, self.val,
-        )
-    }
-}
-
-// leader选举时 每个发送自己的randomshare
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RandomnessShare {
-    pub epoch: SeqNumber,
-    pub round: SeqNumber,
-    pub author: PublicKey,
-    pub signature_share: SignatureShare,
-}
-
-impl RandomnessShare {
-    pub async fn new(
-        epoch: SeqNumber,
-        round: SeqNumber,
-        author: PublicKey,
-        mut signature_service: SignatureService,
-    ) -> Self {
-        let mut hasher = Sha512::new();
-        hasher.update(epoch.to_le_bytes());
-        hasher.update(round.to_le_bytes());
-        let digest = Digest(hasher.finalize().as_slice()[..32].try_into().unwrap());
-        let signature_share = signature_service
-            .request_tss_signature(digest)
+        let share = signature_service
+            .request_tss_signature(Self::coin_digest(wave))
             .await
-            .unwrap();
+            .expect("Missing threshold signing key");
         Self {
-            epoch,
-            round,
+            wave,
             author,
-            signature_share,
+            share,
         }
+    }
+
+    pub fn coin_digest(wave: SeqNumber) -> Digest {
+        let mut hasher = Sha512::new();
+        hasher.update(b"coin");
+        hasher.update(wave.to_le_bytes());
+        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 
     pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
@@ -519,49 +332,28 @@ impl RandomnessShare {
         let tss_pk = pk_set.public_key_share(committee.id(self.author));
         // Check the signature.
         ensure!(
-            tss_pk.verify(&self.signature_share, &self.digest()),
+            tss_pk.verify(&self.share, &Self::coin_digest(self.wave)),
             ConsensusError::InvalidThresholdSignature(self.author)
         );
-
         Ok(())
     }
 }
 
-impl Hash for RandomnessShare {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+impl fmt::Debug for CoinShare {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "CoinShare(author {}, wave {})", self.author, self.wave)
     }
 }
 
-impl fmt::Debug for RandomnessShare {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "RandomnessShare(author {}, epoch {}, round {})",
-            self.author, self.epoch, self.round,
-        )
-    }
+// The last step of the r2 CBC: the QC2 of an r2 block with its author's coin share.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Certificate {
+    pub qc: QC,
+    pub coin: CoinShare,
 }
 
-// f+1 个 RandomnessShare 合成的
-#[derive(Clone, Serialize, Deserialize, Default)]
-pub struct RandomCoin {
-    pub epoch: SeqNumber,
-    pub round: SeqNumber,
-    pub shares: Vec<RandomnessShare>,
-}
-
-impl RandomCoin {}
-
-impl fmt::Debug for RandomCoin {
+impl fmt::Debug for Certificate {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "RandomCoin(epoch {}, round {})",
-            self.epoch, self.round,
-        )
+        write!(f, "Certificate({:?}, {:?})", self.qc, self.coin)
     }
 }

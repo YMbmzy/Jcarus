@@ -1,6 +1,4 @@
-use crate::core::SeqNumber;
-use crypto::{CryptoError, Digest, PublicKey};
-use std::collections::HashSet;
+use crypto::{CryptoError, PublicKey};
 use store::StoreError;
 use thiserror::Error;
 
@@ -24,9 +22,6 @@ pub type ConsensusResult<T> = Result<T, ConsensusError>;
 
 #[derive(Error, Debug)]
 pub enum ConsensusError {
-    #[error("epoch {0} end")]
-    EpochEnd(SeqNumber),
-
     #[error("Network error: {0}")]
     NetworkError(#[from] std::io::Error),
 
@@ -39,26 +34,11 @@ pub enum ConsensusError {
     #[error("Node {0} is not in the committee")]
     NotInCommittee(PublicKey),
 
-    #[error("Phase Wrong value:{0} proof:{1}")]
-    SPBPhaseWrong(u8, u8),
-
-    #[error("Invalid finish phase proof")]
-    InvalidFinProof(),
-
     #[error("Invalid signature")]
     InvalidSignature(#[from] CryptoError),
 
     #[error("Invalid threshold signature from {0}")]
     InvalidThresholdSignature(PublicKey),
-
-    #[error("Invalid prepare tag {0}")]
-    InvalidPrePareTag(u8),
-
-    #[error("timeout smvba message height {0},round {1}")]
-    TimeOutMessage(SeqNumber, SeqNumber),
-
-    #[error("Random coin with wrong leader")]
-    RandomCoinWithWrongLeader,
 
     #[error("Random coin with wrong shares")]
     RandomCoinWithWrongShares,
@@ -66,26 +46,8 @@ pub enum ConsensusError {
     #[error("Received more than one vote from {0}")]
     AuthorityReuseinQC(PublicKey),
 
-    #[error("Received more than one proof from {0} {1:?}")]
-    AuthorityReuseinProof(PublicKey, HashSet<PublicKey>),
-
-    #[error("Received more than one aba_val from {0} phase {1}")]
-    AuthorityReuseinABA(PublicKey, u8),
-
-    #[error("Received more than one aba_out from {0}")]
-    AuthorityReuseinABAOut(PublicKey),
-
-    #[error("Received more than one PrePare from {0}")]
-    AuthorityReuseinPrePare(PublicKey),
-
-    #[error("Received more than one timeout from {0}")]
-    AuthorityReuseinTC(PublicKey),
-
     #[error("Received more than one random share from {0}")]
     AuthorityReuseinCoin(PublicKey),
-
-    #[error("Received more than one vote from {0}")]
-    AuthorityReuseinSPB(PublicKey),
 
     #[error("Received vote from unknown authority {0}")]
     UnknownAuthority(PublicKey),
@@ -93,35 +55,6 @@ pub enum ConsensusError {
     #[error("Received QC without a quorum")]
     QCRequiresQuorum,
 
-    #[error("Received TC without a quorum")]
-    TCRequiresQuorum,
-
-    #[error("Received RandomCoin without a quorum")]
-    RandomCoinRequiresQuorum,
-
-    #[error("Received SPBVote without a quorum")]
-    SPBRequiresQuorum,
-
-    #[error("Malformed block {0}")]
-    MalformedBlock(Digest),
-
-    #[error("Received block {digest} from {author} at height {height}")]
-    WrongAuthor {
-        digest: Digest,
-        author: PublicKey,
-        height: SeqNumber,
-    },
-
     #[error("Invalid payload")]
     InvalidPayload,
-
-    #[error("Block rounds not consecutive! rounds {rd1}, {rd2} and {rd3}")]
-    NonConsecutiveRounds {
-        rd1: SeqNumber,
-        rd2: SeqNumber,
-        rd3: SeqNumber,
-    },
-
-    #[error("Invalid phase")]
-    InvalidPhase(u8),
 }

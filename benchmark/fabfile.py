@@ -159,7 +159,7 @@ def plot(ctx):
 
 @task
 def kill(ctx):
-    ''' Stop any Icarus execution on all machines '''
+    ''' Stop any Jcarus execution on all machines '''
     try:
         Bench(ctx).kill()
     except BenchError as e:

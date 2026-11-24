@@ -317,7 +317,7 @@ class Bench:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to build or upload binaries', e)
 
-        Print.info('Running Icarus')
+        Print.info('Running Jcarus')
         Print.info(f'{bench_parameters.faults} faults')
         Print.info(f'Timeout {node_parameters.timeout_delay} ms, Network delay {node_parameters.network_delay} ms')
         Print.info(f'DDOS attack {node_parameters.ddos}')

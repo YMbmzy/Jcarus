@@ -108,9 +108,9 @@ def remote(ctx):
     ''' Run benchmarks on Alibaba Cloud '''
     bench_params = {
         'nodes': [4],
-        'rate': [4000],
-        'tx_size': 256,
-        'faults': 0, 
+        'rate': [450_000, 550_000],
+        'tx_size': 16,
+        'faults': 0,
         'duration': 100,
         'runs': 1,
     }
@@ -120,7 +120,7 @@ def remote(ctx):
             'timeout_delay': 10_000,
             'sync_retry_delay': 100_000,
             'max_payload_size': 1_000, # size of payloads in block
-            'min_block_delay': 100, # minimum delay between blocks
+            'min_block_delay': 0, # minimum delay between blocks
             'network_delay': 20_000, # message delay on the leaders' proposals during DDoS
             'ddos': False, # True for DDoS attack on the leader, False otherwise
             'random_ddos': False,
@@ -132,8 +132,8 @@ def remote(ctx):
         'mempool': {
             'queue_capacity': 100_000,
             'sync_retry_delay': 100_000,
-            'max_payload_size': 256_000, # payload size
-            'min_block_delay': 100 # minimum delay between payloads
+            'max_payload_size': 16_000, # payload size: 1_000 txs of 16 B
+            'min_block_delay': 0 # minimum delay between payloads
         },
     }
     try:

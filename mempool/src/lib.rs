@@ -6,6 +6,7 @@ mod front;
 mod mempool;
 mod messages;
 mod payload;
+mod queue;
 mod synchronizer;
 
 #[cfg(test)]

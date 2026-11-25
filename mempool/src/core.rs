@@ -2,6 +2,7 @@ use crate::config::{Committee, Parameters};
 use crate::error::{MempoolError, MempoolResult};
 use crate::messages::Payload;
 use crate::payload::PayloadMaker;
+use crate::queue::DigestQueue;
 use crate::synchronizer::Synchronizer;
 use consensus::{Block, ConsensusMempoolMessage, PayloadStatus, SeqNumber};
 use crypto::Hash as _;
@@ -11,7 +12,6 @@ use log::info;
 use log::{error, warn};
 use network::NetMessage;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use store::Store;
@@ -38,8 +38,8 @@ pub struct Core {
     core_channel: Receiver<MempoolMessage>,
     consensus_channel: Receiver<ConsensusMempoolMessage>,
     network_channel: Sender<NetMessage>,
-    opt_queue: HashSet<Digest>,
-    pes_queue: HashSet<Digest>,
+    opt_queue: DigestQueue,
+    pes_queue: DigestQueue,
 }
 
 impl Core {
@@ -55,8 +55,8 @@ impl Core {
         consensus_channel: Receiver<ConsensusMempoolMessage>,
         network_channel: Sender<NetMessage>,
     ) -> Self {
-        let opt_queue = HashSet::with_capacity(parameters.queue_capacity);
-        let pes_queue = HashSet::with_capacity(parameters.queue_capacity);
+        let opt_queue = DigestQueue::default();
+        let pes_queue = DigestQueue::default();
         Self {
             name,
             committee,
@@ -99,8 +99,8 @@ impl Core {
     ) -> MempoolResult<()> {
         // Drop the transaction if our mempool is full.
         ensure!(
-            self.opt_queue.len() < self.opt_queue.capacity()
-                && self.pes_queue.len() < self.pes_queue.capacity(),
+            self.opt_queue.len() < self.parameters.queue_capacity
+                && self.pes_queue.len() < self.parameters.queue_capacity,
             MempoolError::MempoolFull
         );
 
@@ -209,37 +209,11 @@ impl Core {
         } 
         // #[cfg(feature = "benchmark")]
         // info!("Before:opt_queue_size: {}, pes_queue_size: {}", self.opt_queue.len(), self.pes_queue.len());
+        // Own payloads first, then other nodes' payloads; oldest first in each.
         let digest_len = Digest::default().size();
-        let mut payload_len = max / digest_len;
-        let mut digests = Vec::new();
-
-        if !self.opt_queue.is_empty() {
-            let opt_digests: Vec<_> = self
-                .opt_queue
-                .iter()
-                .take(payload_len)
-                .cloned()
-                .collect();
-
-            for x in &opt_digests {
-                self.opt_queue.remove(x);  // 去重
-            }
-            digests.extend(opt_digests);  // 直接追加已克隆的 digests
-            payload_len -= digests.len(); // 减去实际添加的数量
-        }
-
-        let pes_digests: Vec<_> = self
-            .pes_queue
-            .iter()
-            .take(payload_len)
-            .cloned()
-            .collect();
-
-        for x in &pes_digests {
-            self.pes_queue.remove(x); // 去重
-        }
-
-        digests.extend(pes_digests);
+        let mut digests = self.opt_queue.take(max / digest_len);
+        let remaining = max / digest_len - digests.len();
+        digests.extend(self.pes_queue.take(remaining));
         // #[cfg(feature = "benchmark")]
         // info!("After:opt_queue_size: {}, pes_queue_size: {}", self.opt_queue.len(), self.pes_queue.len());
         Ok(digests)

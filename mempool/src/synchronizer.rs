@@ -8,7 +8,7 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, warn};
 use network::NetMessage;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,7 +56,6 @@ impl Synchronizer {
                             // with different round numbers or different payloads.
 
                             let block_digest = block.digest();
-                            let author = block.author;
                             let round = block.height;
                             if pending.contains_key(&block_digest) {    //如果处理过，就不用在处理了
                                 continue;
@@ -68,29 +67,16 @@ impl Synchronizer {
                             let fut = Self::waiter(wait_for, block, rx_cancel);
                             waiting.push(fut);
 
-                            let missing: Vec<_> = missing
-                                .drain()
-                                .filter(|x| !requests.contains_key(x))
-                                .collect();
-                            if !missing.is_empty() {
-                                let now = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .expect("Failed to measure time")
-                                    .as_millis();
-                                for x in &missing {
-                                    requests.insert(x.clone(), (round, now));
-                                }
-
-                                let message = MempoolMessage::PayloadRequest(missing.clone(), name); //向发送block的节点请求payload
-                                Self::transmit(
-                                    &message,
-                                    &name,
-                                    Some(&author),
-                                    &committee,
-                                    &network_channel
-                                )
-                                .await
-                                .expect("Failed to send payload sync request");
+                            // Every referenced payload was broadcast to all nodes by its author, so
+                            // wait for it instead of requesting it now: an immediate request makes the
+                            // block author send it a second time whenever the block overtakes it.
+                            // Only payloads still missing after `sync_retry_delay` are requested.
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis();
+                            for x in missing.drain() {
+                                requests.entry(x).or_insert((round, now));
                             }
                         },
                         SynchronizerMessage::Clean(mut round) => {
@@ -133,6 +119,18 @@ impl Synchronizer {
                             .cloned()
                             .collect();
                         if !retransmit.is_empty() {
+                            // Payloads only go missing for this long if a broadcast was lost.
+                            warn!(
+                                "{} payloads still missing after {} ms, requesting them from all nodes",
+                                retransmit.len(),
+                                sync_retry_delay
+                            );
+                            // Wait another `sync_retry_delay` before asking again.
+                            for x in &retransmit {
+                                if let Some((_, timestamp)) = requests.get_mut(x) {
+                                    *timestamp = now;
+                                }
+                            }
                             let message = MempoolMessage::PayloadRequest(retransmit, name);
                             Self::transmit(
                                 &message,

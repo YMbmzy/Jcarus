@@ -26,8 +26,12 @@ pub type SeqNumber = u64;
 pub const BLOCK_CHANNEL: u8 = 0;
 pub const FAST_CHANNEL: u8 = 1;
 
-// Number of rounds kept below the latest committed leader.
-pub const GC_DEPTH: SeqNumber = 50;
+// Number of rounds kept below the latest committed leader. Garbage collection
+// is disabled: with it, the others ignore the blocks of a node lagging more
+// than GC_DEPTH rounds behind, so it can never certify its r1 block again and
+// stops proposing. Benchmark runs are short, and committed payloads still
+// leave the mempool queues.
+pub const GC_DEPTH: SeqNumber = SeqNumber::MAX;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ConsensusMessage {
